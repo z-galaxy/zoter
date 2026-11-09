@@ -3,15 +3,44 @@
 use std::{
     env,
     os::fd::{OwnedFd, RawFd},
-    path::Path,
-    process::Command,
+    path::{Path, PathBuf},
+    process::{self, Command},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use rustix::pipe::{PipeFlags, pipe_with};
+use rustix::{
+    io::read,
+    pipe::{PipeFlags, pipe_with},
+};
 
 /// The two ends of a pipe, read first.
 pub(crate) fn pipe() -> (OwnedFd, OwnedFd) {
     pipe_with(PipeFlags::CLOEXEC).unwrap()
+}
+
+/// The next byte that `fd` gives.
+pub(crate) fn read_byte(fd: &OwnedFd) -> u8 {
+    let mut byte = [0];
+    assert_eq!(read(fd, &mut byte).unwrap(), 1);
+
+    byte[0]
+}
+
+/// A name that no other test, or run of the tests, uses.
+pub(crate) fn unique_name() -> String {
+    // The tests of a process run on threads of their own, at once.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    format!(
+        "zoter-{}-{}",
+        process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// A path in the temporary directory that no other test uses.
+pub(crate) fn unique_path() -> PathBuf {
+    env::temp_dir().join(unique_name())
 }
 
 /// Whether `fd` is open in this process.

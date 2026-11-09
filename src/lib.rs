@@ -4,6 +4,8 @@
 #![cfg(target_os = "linux")]
 #![deny(missing_docs, rust_2018_idioms)]
 
+mod notifier;
+pub use notifier::Notifier;
 mod passed;
 pub use passed::Passed;
 mod save;
