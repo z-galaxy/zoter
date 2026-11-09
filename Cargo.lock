@@ -93,6 +93,7 @@ dependencies = [
 name = "zoter"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rustix",
  "tracing",
 ]

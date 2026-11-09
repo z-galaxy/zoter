@@ -10,6 +10,8 @@ mod passed;
 pub use passed::Passed;
 mod save;
 pub use save::{Restore, Save};
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 #[cfg(test)]
 mod test_utils;
