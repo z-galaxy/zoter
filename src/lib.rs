@@ -4,6 +4,8 @@
 #![cfg(target_os = "linux")]
 #![deny(missing_docs, rust_2018_idioms)]
 
+mod passed;
+pub use passed::Passed;
 mod save;
 pub use save::{Restore, Save};
 
