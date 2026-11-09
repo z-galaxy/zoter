@@ -11,7 +11,7 @@ use std::{
 ///
 /// [`Restore`] gives it back from them, in the next instance. A protocol implements both for the
 /// hand-over of a connection, as zbus does for D-Bus, so that a service hands its connections over
-/// as they are, as items of a hand-over.
+/// as they are, as items of a [`Handover`](crate::Handover).
 ///
 /// The trait takes no generics, and its methods return no `impl Trait`, so that the items of a
 /// hand-over can be of different types, as `dyn Save`.

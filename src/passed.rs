@@ -20,7 +20,8 @@ use rustix::io::{FdFlags, fcntl_setfd};
 /// send. The names aren't unique, and the file descriptors come in no set order but for the stored
 /// ones coming last, so tell them apart by their names rather than their places.
 ///
-/// The service takes them by name.
+/// [`Store::take_over`](crate::Store::take_over) takes those of a hand-over out of it, and what is
+/// left is for the service to take, by name.
 #[derive(Debug, Default)]
 pub struct Passed {
     fds: Vec<(String, OwnedFd)>,
@@ -117,6 +118,13 @@ impl Passed {
     /// The file descriptors that are left, with their names, in their order.
     pub fn into_vec(self) -> Vec<(String, OwnedFd)> {
         self.fds
+    }
+
+    /// Take every file descriptor whose name starts with `prefix`, with its name, in their order.
+    pub(crate) fn take_prefixed(&mut self, prefix: &str) -> Vec<(String, OwnedFd)> {
+        self.fds
+            .extract_if(.., |(name, _)| name.starts_with(prefix))
+            .collect()
     }
 }
 
@@ -318,6 +326,8 @@ mod tests {
             ("a".to_owned(), fd()),
             ("b".to_owned(), fd()),
             ("a".to_owned(), fd()),
+            ("prefix/x".to_owned(), fd()),
+            ("prefix/y".to_owned(), fd()),
         ]);
         let numbers =
             |passed: &Passed| -> Vec<_> { passed.iter().map(|(_, fd)| fd.as_raw_fd()).collect() };
@@ -325,6 +335,18 @@ mod tests {
 
         assert!(passed.take("c").is_none());
         assert_eq!(passed.take("a").unwrap().as_raw_fd(), all[0]);
+        let prefixed: Vec<_> = passed
+            .take_prefixed("prefix/")
+            .into_iter()
+            .map(|(name, fd)| (name, fd.as_raw_fd()))
+            .collect();
+        assert_eq!(
+            prefixed,
+            [
+                ("prefix/x".to_owned(), all[3]),
+                ("prefix/y".to_owned(), all[4])
+            ]
+        );
         let names: Vec<_> = passed.iter().map(|(name, _)| name).collect();
         assert_eq!(names, ["b", "a"]);
         let taken: Vec<_> = passed
