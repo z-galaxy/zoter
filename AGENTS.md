@@ -45,6 +45,35 @@ cargo check --all-features --target x86_64-pc-windows-gnu
 cargo doc --all-features
 ```
 
+## Architecture Overview
+
+```
+src/
+├── lib.rs         # Re-exports the API below; the README is the crate docs
+├── log.rs         # warn!/debug! through `tracing`, or nothing without the feature
+├── save.rs        # Save and Restore: what an item of a hand-over is, a record and FDs
+├── passed.rs      # Passed: the FDs that systemd passes, as sd_listen_fds(3) takes them
+├── notifier.rs    # Notifier: $NOTIFY_SOCKET, as sd_notify(3) has it, storing FDs and barriers
+├── limit.rs       # raise_fd_limit
+├── handover.rs    # Handover: a hand-over that a store started; Stored and LeftOut: what went
+├── store.rs       # Store: handover, take_over and storing, fitting the items, the reserved FDs
+├── store/tests.rs # Its tests, against testing::Manager in the test process
+├── restored.rs    # Restored and RestoredItem: what was handed over, read in place
+├── layout.rs      # The format of the memfd: header, table of the items, records
+├── memfd.rs       # Sealed memfds, written and read in place through mappings (the unsafe code)
+├── queue.rs       # Sockets whose queues hold any number of FDs, as one FD of the store
+├── testing.rs     # [testing feature] Manager: a fake service manager for tests
+└── test_utils.rs  # What the unit tests share, such as running a test in a process of its own
+tests/restart.rs   # [testing feature] A restart end to end: the test binary is the service
+```
+
+`Handover::store` lays a hand-over out in one memfd, stored under `<key>/state`, and puts the FDs
+of the state and of the items in the queues of sockets, stored under `<key>/fds`, as many as that
+takes. `Store::take_over` takes the names of its key out of `Passed`, removes them from the store
+first, maps the memfd, and takes the FDs out of the queues by their indexes. The tests that take
+FDs from 3 on, or change the environment or the limit of open FDs, run in a process of their own
+(`test_utils::in_own_process`).
+
 ## Development Guidelines
 
 - **MSRV**: 1.88.0, which zlink has.
