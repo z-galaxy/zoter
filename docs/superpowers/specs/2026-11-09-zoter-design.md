@@ -71,7 +71,8 @@ stores under, the layout of the memfd, busd's state and zbus's API can all chang
 fn main() -> io::Result<()> {
     // The next instance takes the FDs of the hand-over out of the queue sockets under this limit.
     zoter::raise_fd_limit()?;
-    // SAFETY: No other thread runs yet, so none reads or writes the environment meanwhile.
+    // SAFETY: No other thread runs yet, so none reads or writes the environment meanwhile, and
+    // nothing took the FDs that systemd passed.
     let passed = unsafe { zoter::Passed::from_env() }?;
 
     runtime.block_on(serve(passed))
@@ -106,31 +107,32 @@ async fn serve(mut passed: zoter::Passed) -> io::Result<()> {
     }
 
     sigterm.await;
-    // Without a store to hand over through, the service shuts down as it does without systemd.
+    // Without a store to hand over through, the service shuts down as it does without systemd, as
+    // it does with one that can't take a hand-over, which it finds out before it stops serving.
     let Some(store) = store else {
         return server.shut_down().await;
     };
-    if let Err(e) = store.check_hand_over() {
-        warn!("Not handing over to the next instance: {e}");
+    let handover = match store.handover() {
+        Ok(handover) => handover,
+        Err(e) => {
+            warn!("Not handing over to the next instance: {e}");
 
-        return server.shut_down().await;
-    }
+            return server.shut_down().await;
+        }
+    };
     // The service's own async work: stop taking requests, finish those it took, and take each
     // connection apart. Bounded by a timeout of the service's choosing.
     let (state, connections) = server.pause().await?;
-    let mut handover = zoter::Handover::with_state(state.encode());
-    for (id, connection) in &connections {
-        handover.push(*id, connection);
-    }
     // Lays the hand-over out in the store, waits for systemd to have dealt with it, and returns.
-    let stored = store.hand_over(handover)?;
+    let items = connections.iter().map(|(id, connection)| (*id, connection));
+    let stored = handover.store(state.encode(), items)?;
 
     Ok(())
 }
 ```
 
 systemd starts the next instance with the sockets of socket activation and what was stored, and
-`Store::take_over` gives back what `Store::hand_over` stored. The unit needs
+`Store::take_over` gives back what `Handover::store` stored. The unit needs
 `FileDescriptorStoreMax=` of 2 at least (the state memfd and one queue socket), systemd 254 or
 later (for `$FDSTORE`), and a socket unit, so that systemd keeps the listening socket, and the
 clients that connect meanwhile, while no instance runs.
@@ -167,8 +169,9 @@ The names are those of zbus's methods today, which the traits take the place of.
 generics and returns no `impl Trait`, so that a hand-over can hold items of different types, as
 `dyn Save`. It is implemented for `[u8]` and `Vec<u8>` (a record with no FDs), for `OwnedFd` and
 `BorrowedFd` (one FD with an empty record), and for `&T` and `Box<T>`; `Restore` for `Vec<u8>`
-and `OwnedFd`. Records are copied once, from the item into the memfd, and read back in place:
-zbus's records are a multiple of 8 bytes long, and each record starts at a multiple of 8.
+and `OwnedFd`, and for `(Vec<u8>, Vec<OwnedFd>)`, a record and its FDs as they are. Records are
+copied once, from the item into the memfd, and read back in place: zbus's records are a multiple of
+8 bytes long, and each record starts at a multiple of 8.
 
 ### `Passed`: what systemd passed to this process
 
@@ -186,7 +189,9 @@ impl Passed {
     /// # Safety
     ///
     /// No other thread may read or write the environment meanwhile, as for
-    /// `std::env::remove_var`: call it before the process starts any other thread.
+    /// `std::env::remove_var`: call it before the process starts any other thread. Nothing else
+    /// in the process may own the FDs that the environment tells of, as an `sd_listen_fds(0)`
+    /// that took them before does: those go to `Passed::new`.
     pub unsafe fn from_env() -> io::Result<Self>;
     /// FDs passed some other way, with their names.
     pub fn new(fds: Vec<(String, OwnedFd)>) -> Self;
@@ -204,7 +209,9 @@ impl Passed {
 `from_env` is the one `unsafe` function of the API. Edition 2024 makes `std::env::remove_var`
 unsafe, as it is unsound while another thread reads the environment, and the alternative of
 leaving the variables there lets a later `sd_listen_fds` in the same process, or the process
-executing itself anew, take FDs that are long closed, or other ones under their numbers.
+executing itself anew, take FDs that are long closed, or other ones under their numbers. It also
+takes the FDs as its own, by their numbers, which is only sound if nothing else in the process
+owns them already, as something does that took them before.
 
 ### `Notifier`: the notification socket
 
@@ -219,8 +226,9 @@ stay strings (`"READY=1"`, `"STOPPING=1"`, `"EXTEND_TIMEOUT_USEC=…"`); typed o
 ```rust
 /// The store of the service, for handing it over to its next instance under `key`.
 ///
-/// It keeps a few FDs open from its creation on, which `hand_over` gives up for those that storing
-/// opens, so that storing can't fail for want of FDs, however many the service has open by then.
+/// It keeps a few FDs open from its creation on, which it gives up for those that storing a
+/// hand-over opens, so that storing can't fail for want of FDs, however many the service has open
+/// by then.
 #[derive(Debug)]
 pub struct Store { /* notifier, key, $FDSTORE, the FD limit, the reserved FDs */ }
 
@@ -232,18 +240,16 @@ impl Store {
     pub fn notifier(&self) -> &Notifier;
     /// How many FDs the store takes, as `FileDescriptorStoreMax=` of the unit sets it.
     pub fn max(&self) -> Option<usize>;
-    /// Check that `hand_over` can store anything: that the store takes the state memfd and a
-    /// queue socket. It fails with `ErrorKind::Unsupported` otherwise, saying why, and which
-    /// setting of the unit to change. It logs nothing, and `hand_over` checks the same.
-    pub fn check_hand_over(&self) -> io::Result<()>;
     /// The soft limit of open FDs that the next instance is taken to have, `None` for none: the
     /// one that this process had as the store was created, unless set otherwise.
     pub fn set_fd_limit(&mut self, limit: Option<u64>);
     /// Take over from the previous instance: take the FDs stored under the key out of `passed`,
     /// remove them from the store, and read the hand-over that they hold, if any.
     pub fn take_over(&mut self, passed: &mut Passed) -> io::Result<Option<Restored>>;
-    /// Store `handover` for the next instance, and wait for systemd to have dealt with it.
-    pub fn hand_over(self, handover: Handover<'_>) -> io::Result<Stored>;
+    /// Start a hand-over to the next instance: it fails with `ErrorKind::Unsupported` if the
+    /// store can't take one (the state memfd and a queue socket), saying why, and which setting
+    /// of the unit to change. It logs nothing.
+    pub fn handover(self) -> io::Result<Handover>;
 }
 ```
 
@@ -253,27 +259,34 @@ hand-over that the next instance fails on, or crashes on, isn't found by the one
 ### `Handover`: what a service hands over
 
 ```rust
-/// What a service hands over: its state, and items, such as connections, under ids of its own.
-pub struct Handover<'a> { /* the state, the items, the rules of fitting them */ }
+/// A hand-over to the next instance, which `Store::handover` started.
+#[derive(Debug)]
+pub struct Handover { /* the store, the rules of fitting the items */ }
 
-impl<'a> Handover<'a> {
-    /// A hand-over whose state is empty.
-    pub fn new() -> Self;
-    pub fn with_state(state: impl Save + 'a) -> Self;
-    /// Hand `item` over under `id`, which the crate doesn't look at: the state can refer to it.
-    pub fn push(&mut self, id: u64, item: impl Save + 'a);
+impl Handover {
     /// How many FDs each item takes in the next instance besides those that it hands over, such
     /// as the pidfd of the peer of a connection that busd opens: none, unless set.
     pub fn set_extra_fds_per_item(&mut self, count: usize);
     /// How many FDs the next instance keeps free, besides the items, for those that it opens of
     /// its own as it starts: 32, as busd has it, unless set.
     pub fn set_spare_fds(&mut self, count: usize);
-    pub fn len(&self) -> usize;
-    pub fn is_empty(&self) -> bool;
+    pub fn notifier(&self) -> &Notifier;
+    /// Store `state`, and `items`, each under an id that the crate doesn't look at, so that the
+    /// state can refer to it, for the next instance, and wait for systemd to have dealt with it.
+    pub fn store<S, I, T>(self, state: S, items: I) -> io::Result<Stored>
+    where
+        S: Save,
+        I: IntoIterator<Item = (u64, T)>,
+        T: Save;
 }
 ```
 
-`hand_over` fits the items under the limit of open FDs of the next instance, in order, leaving out
+The service starts the hand-over before it stops serving, so that it finds out first if it can't
+hand over, and gives the state and the items to `store` once it stopped: a hand-over that held them
+from its start would hold borrows of what the service makes later, which its drop would outlive.
+Items of different types go as `&dyn Save` or `Box<dyn Save>`.
+
+`store` fits the items under the limit of open FDs of the next instance, in order, leaving out
 whole those that don't fit, as busd's `fit` does. An item that can't be saved, or whose `save`
 fails, is left out alone. What was left out, and why, is in the `Stored` that it returns:
 
@@ -290,13 +303,15 @@ pub enum LeftOut {
     Save(io::Error),
     /// Its FDs don't fit under the limit of open FDs of the next instance.
     FdLimit,
-    /// Its FDs didn't fit in the store, or failed to be queued.
+    /// Its FDs didn't fit in the store.
     Store,
+    /// Its FDs failed to be queued, with an error of this kind.
+    Queue(io::ErrorKind),
 }
 ```
 
 Nothing is stored of an item that is left out, so its peer is disconnected once its FDs close:
-as `hand_over` returns, for an item that it was given by value, and as the caller drops it, for
+as `store` returns, for an item that it was given by value, and as the caller drops it, for
 one that it was given by reference. busd disconnects the clients that don't fit so.
 
 ### `Restored`: what the previous instance handed over
@@ -338,8 +353,8 @@ pub fn raise_fd_limit() -> io::Result<Option<u64>>;
 ```
 
 The next instance takes the FDs of a hand-over out of the queue sockets under its soft limit, and
-the kernel closes those that don't fit, so it raises the limit first; `hand_over` fits the items
-under the limit that this instance had, which it takes the next one to have too.
+the kernel closes those that don't fit, so it raises the limit first; `Handover::store` fits the
+items under the limit that this instance had, which it takes the next one to have too.
 
 ## What the store holds
 
@@ -392,8 +407,8 @@ Taking over:
 
 Handing over:
 
-- `check_hand_over` fails (no `$FDSTORE`, or fewer than 2): so does `hand_over`, with
-  `ErrorKind::Unsupported`, and the caller should have shut down rather than paused.
+- The store can't take a hand-over (no `$FDSTORE`, or fewer than 2): `Store::handover` fails with
+  `ErrorKind::Unsupported`, before the service paused, which shuts down instead.
 - Items that can't be saved, items over the limit of open FDs, items whose `save` fails, and items
   whose FDs don't fit in the store (`FileDescriptorStoreMax=` too low) or fail to be queued: left
   out, in `Stored`, with a warning that names the setting of the unit to raise, if any.
@@ -413,8 +428,9 @@ gives it, under their names, and starts a service as systemd does: `Manager::com
 gives a `std::process::Command` with `$NOTIFY_SOCKET`, `$FDSTORE`, `$LISTEN_FDS` and
 `$LISTEN_FDNAMES` set, the passed FDs from 3 on, and `$LISTEN_PID` set to the PID of the service.
 For a service that runs in the test process, `Manager::notifier` and `Manager::passed` give what
-`Store::from_env` and `Passed::from_env` would. Tests wait for a state (`until("READY=1")`), look
-at the store, and empty it, as a stop does. busd, zbus and zlink test their restarts with it.
+`Store::from_env` and `Passed::from_env` would. Tests wait for a state
+(`wait_for("READY=1", timeout)`), look at the store, and empty it, as a stop does. busd, zbus and
+zlink test their restarts with it.
 
 It needs `libc`, which rustix doesn't replace there: `dup2` onto FDs that the child doesn't own yet,
 and `kcmp(2)`, to tell FDs of one open file description apart as systemd does. Both are optional
@@ -492,8 +508,8 @@ With a feature on Linux, with `std`, as the hand-over of zbus is:
   `Store::take_over`, decodes its state, restores each client's connection with
   `RestoredItem::restore::<connection::Handover>`, by id, and listens on the one socket of socket
   activation left in `Passed`. `Bus::hand_over_to_systemd` keeps busd's own rule (no hand-over
-  without socket activation) and timeout, pushes each client's `connection::Handover` under its
-  id, with one extra FD per client (its pidfd), and calls `Store::hand_over`. `queue`,
+  without socket activation) and timeout, and stores each client's `connection::Handover` under
+  its id, with one extra FD per client (its pidfd), through `Handover::store`. `queue`,
   `take_queued`, `take_fds`, `bytes_at`, `fit`, `Reserve`, `StoredFds` and their constants go to
   the crate. Its module docs keep what is the bus's, and point to the crate's for the rest.
 - The state loses `Stored` (where each record and its FDs are), which the crate's table says now,
