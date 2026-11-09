@@ -30,7 +30,12 @@ use rustix::{
     net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg},
 };
 
-use crate::{Notifier, Passed, notifier::MAX_FDS, passed::START};
+use crate::{
+    Notifier, Passed,
+    notifier::MAX_FDS,
+    passed::START,
+    queue::{self, Queue},
+};
 
 /// A service manager for tests, which runs a service as systemd does, with the sockets of socket
 /// activation and a file descriptor store, without systemd.
@@ -263,6 +268,34 @@ impl Manager {
             .iter()
             .map(|(name, fd)| Ok((name.clone(), fd.try_clone()?)))
             .collect()
+    }
+
+    /// How many file descriptors the hand-over under `key` holds in its queue sockets, those of its
+    /// state included, in its items, as a service stored them with
+    /// [`Handover::store`](crate::Handover::store).
+    ///
+    /// The queue sockets give their file descriptors up as they are read, so this takes them out
+    /// and puts them back in queue sockets of its own, which take their places in the store. It
+    /// fails as reading a queue does, as with a socket that no hand-over stored.
+    pub fn stored_fds(&self, key: &str) -> io::Result<usize> {
+        let name = format!("{key}/fds");
+        let mut state = self.shared.state();
+        let mut count = 0;
+        for (_, socket) in state.store.iter_mut().filter(|(stored, _)| *stored == name) {
+            let mut taken = Vec::new();
+            queue::take(socket.as_fd(), |index, fds, _| taken.push((index, fds)))?;
+            let refilled = Queue::new()?;
+            for (index, fds) in &taken {
+                let fds: Vec<_> = fds.iter().map(AsFd::as_fd).collect();
+                if !refilled.push(*index, &fds)? {
+                    return Err(io::Error::other("a queue of the manager is full"));
+                }
+                count += fds.len();
+            }
+            *socket = refilled.into_socket();
+        }
+
+        Ok(count)
     }
 
     /// Put `fds` in the store in place of what it holds, as for a test to hand a service over what
@@ -524,6 +557,41 @@ mod tests {
         assert_eq!(names, ["example.socket", "stored"]);
         assert_eq!(manager.take_sockets().len(), 1);
         assert_eq!(manager.passed().unwrap().len(), 1);
+    }
+
+    /// The file descriptors of a hand-over are counted, and stay in the store.
+    #[test]
+    fn stored_fds() {
+        let manager = Manager::new().unwrap();
+        let store = crate::Store::new(manager.notifier().unwrap(), "test", Some(2)).unwrap();
+        let items = [(1, Fds(vec![pipe().1])), (2, Fds(vec![pipe().1, pipe().1]))];
+        store.handover().unwrap().store(&[][..], items).unwrap();
+
+        assert_eq!(manager.stored_fds("test").unwrap(), 3);
+        assert_eq!(manager.stored_fds("test").unwrap(), 3);
+        assert_eq!(manager.stored_fds("other").unwrap(), 0);
+        let mut passed = manager.passed().unwrap();
+        let mut store = crate::Store::new(manager.notifier().unwrap(), "test", Some(2)).unwrap();
+        let mut restored = store.take_over(&mut passed).unwrap().unwrap();
+        let fds: Vec<_> = restored.take_items().map(|item| item.fds.len()).collect();
+        assert_eq!(fds, [1, 2]);
+    }
+
+    /// File descriptors with an empty record.
+    struct Fds(Vec<OwnedFd>);
+
+    impl crate::Save for Fds {
+        fn saved_len(&self) -> Option<usize> {
+            Some(0)
+        }
+
+        fn save(&self, _dest: &mut [u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+            self.0.iter().map(AsFd::as_fd).collect()
+        }
     }
 
     /// The service runs with its file descriptors from 3 on, and the variables that tell of them
