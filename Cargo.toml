@@ -1,0 +1,53 @@
+[package]
+name = "zoter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["Zeeshan Ali Khan <zeeshanak@gnome.org>"]
+description = "Restart systemd services without dropping their clients"
+repository = "https://github.com/z-galaxy/zoter"
+keywords = ["systemd", "restart", "fdstore", "socket-activation", "handover"]
+categories = ["os::linux-apis", "network-programming"]
+readme = "README.md"
+# The tooling of the repository, such as its CI, git hooks, design docs and guidance for AI agents,
+# is of no use to those who build the crate.
+exclude = [
+    ".codespellrc",
+    ".commitlintrc.mjs",
+    ".editorconfig",
+    ".githooks/",
+    ".github/",
+    ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "docs/",
+    "release-plz.toml",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+# The crate builds nothing on platforms other than Linux, where systemd is.
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+default = ["tracing"]
+# Logs through `tracing` what a restart left out, and which setting of the unit would have kept it;
+# a build without it logs nothing.
+tracing = ["dep:tracing"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `net` is for the notification socket and the sockets of the queues, `fs` and `mm` for the memfd,
+# which is mapped into memory, `pipe` and `event` for the barrier, and `process` for the limit of
+# open file descriptors. `std` makes rustix share the types of std with its callers (`OwnedFd`,
+# `io::Error`).
+rustix = { version = "1.1.6", default-features = false, features = [
+    "event",
+    "fs",
+    "mm",
+    "net",
+    "pipe",
+    "process",
+    "std",
+] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
