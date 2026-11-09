@@ -252,6 +252,16 @@ impl Manager {
         }
     }
 
+    /// The text of each notification that came and that [`wait_for`](Self::wait_for) didn't let
+    /// go of, oldest first, to wait for none of them again.
+    ///
+    /// The manager deals with the notifications on a thread of its own, so a notification sent
+    /// just before this may not be among them: a [`Notifier::barrier`] of the test is dealt with
+    /// once those that came before it are.
+    pub fn take_notifications(&self) -> Vec<String> {
+        self.shared.state().notifications.drain(..).collect()
+    }
+
     /// The names of what is in the store, in the order that it was stored.
     pub fn stored_names(&self) -> Vec<String> {
         let state = self.shared.state();
@@ -542,6 +552,11 @@ mod tests {
             .wait_for("READY=1", Duration::from_millis(100))
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::TimedOut);
+
+        notifier.notify("STATUS=Down").unwrap();
+        notifier.barrier(WAIT).unwrap();
+        assert_eq!(manager.take_notifications(), ["STATUS=Down", "BARRIER=1"]);
+        assert!(manager.take_notifications().is_empty());
     }
 
     #[test]
