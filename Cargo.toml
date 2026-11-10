@@ -58,6 +58,15 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"], op
 # through `kcmp(2)`, as systemd does: rustix has neither.
 libc = { version = "0.2.191", optional = true }
 
-# The unit tests use the fake service manager too.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+# The benchmarks, through CodSpeed's build of criterion, which times them as criterion does
+# elsewhere.
+criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
+# The unit tests use the fake service manager too.
 libc = "0.2.191"
+
+[[bench]]
+name = "handover"
+harness = false
+# It hands over through the fake service manager.
+required-features = ["testing"]

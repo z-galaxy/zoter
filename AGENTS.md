@@ -43,6 +43,9 @@ cargo check --all-features --target x86_64-pc-windows-gnu
 
 # Documentation
 cargo doc --all-features
+
+# Benchmarks: storing hand-overs and taking them over, through the fake service manager
+cargo bench --features testing --bench handover
 ```
 
 ## Architecture Overview
@@ -65,6 +68,7 @@ src/
 ├── testing.rs     # [testing feature] Manager: a fake service manager for tests
 └── test_utils.rs  # What the unit tests share, such as running a test in a process of its own
 tests/restart.rs   # [testing feature] A restart end to end: the test binary is the service
+benches/handover.rs # [testing feature] What storing a hand-over and taking it over cost
 ```
 
 `Handover::store` lays a hand-over out in one memfd, stored under `<key>/state`, and puts the FDs
