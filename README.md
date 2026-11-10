@@ -8,6 +8,9 @@
   <a href="https://crates.io/crates/zoter">
     <img alt="crates.io" src="https://img.shields.io/crates/v/zoter">
   </a>
+  <a href="https://app.codspeed.io/z-galaxy/zoter?utm_source=badge">
+    <img alt="CodSpeed" src="https://img.shields.io/endpoint?url=https://codspeed.io/badge.json">
+  </a>
 </p>
 
 <h1 align="center">zoter</h1>
@@ -136,6 +139,18 @@ In development: nothing is released yet, and the API can change at any time.
 ## License
 
 [MIT](https://github.com/z-galaxy/zoter/blob/main/LICENSE)
+
+## Sponsors
+
+<a href="https://codspeed.io/?utm_source=oss-sponsorship&utm_medium=z-galaxy">
+  <picture>
+    <source media="(prefers-color-scheme: dark)"
+      srcset="https://codspeed.io/codspeed-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)"
+      srcset="https://codspeed.io/codspeed-logo-light.svg">
+    <img alt="CodSpeed logo" src="https://codspeed.io/codspeed-logo-light.svg" width="400">
+  </picture>
+</a>
 
 [`Passed`]: https://docs.rs/zoter/latest/zoter/struct.Passed.html
 [`Notifier`]: https://docs.rs/zoter/latest/zoter/struct.Notifier.html

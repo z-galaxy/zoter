@@ -48,6 +48,10 @@ cargo doc --all-features
 cargo bench --features testing --bench handover
 ```
 
+On CodSpeed, `.github/workflows/bench.yml` measures the bench target by the clock, on a CodSpeed
+macro runner: it passes file descriptors over sockets, and waits on the thread of the fake service
+manager, which CodSpeed's simulation of the CPU leaves out.
+
 ## Architecture Overview
 
 ```
