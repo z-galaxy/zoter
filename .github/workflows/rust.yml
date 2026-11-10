@@ -1,0 +1,91 @@
+name: Lint, Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  MSRV:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      MSRV: 1.88.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+          targets: x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      # The crate builds nothing on platforms other than Linux, which the other targets check: with
+      # no error, and no warning.
+      - name: Check build with MSRV
+        run: |
+          cargo --locked check --all-features
+          cargo --locked check --no-default-features
+          cargo --locked check --all-features --target x86_64-apple-darwin
+          cargo --locked check --all-features --target x86_64-unknown-freebsd
+          cargo --locked check --all-features --target x86_64-pc-windows-gnu
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # We use some nightly fmt options.
+          toolchain: nightly
+          components: rustfmt
+      - name: Check formatting
+        run: cargo --locked fmt -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+          targets: x86_64-apple-darwin, x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Catch common mistakes and unwrap calls
+        run: |
+          cargo --locked clippy --all-targets --all-features
+          cargo --locked clippy --all-targets --no-default-features
+          cargo --locked clippy --all-targets --all-features --target x86_64-apple-darwin
+          cargo --locked clippy --all-targets --all-features --target x86_64-pc-windows-gnu
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    env:
+      RUSTFLAGS: -D warnings
+      RUST_BACKTRACE: full
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test with all features
+        run: cargo --locked test --all-features
+      - name: Test without the default features
+        run: cargo --locked test --no-default-features
+
+  doc_build:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check documentation build
+        run: cargo --locked doc --all-features

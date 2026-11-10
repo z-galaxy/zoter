@@ -1,0 +1,72 @@
+[package]
+name = "zoter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["Zeeshan Ali Khan <zeeshanak@gnome.org>"]
+description = "Restart systemd services without dropping their clients"
+repository = "https://github.com/z-galaxy/zoter"
+keywords = ["systemd", "restart", "fdstore", "socket-activation", "handover"]
+categories = ["os::linux-apis", "network-programming"]
+readme = "README.md"
+# The tooling of the repository, such as its CI, git hooks, design docs and guidance for AI agents,
+# is of no use to those who build the crate.
+exclude = [
+    ".codespellrc",
+    ".commitlintrc.mjs",
+    ".editorconfig",
+    ".githooks/",
+    ".github/",
+    ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "docs/",
+    "release-plz.toml",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+# The crate builds nothing on platforms other than Linux, where systemd is.
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+default = ["tracing"]
+# Logs through `tracing` what a restart left out, and which setting of the unit would have kept it;
+# a build without it logs nothing.
+tracing = ["dep:tracing"]
+# `zoter::testing`: a fake service manager, for the tests of the restarts of services.
+testing = ["dep:libc"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `net` is for the notification socket and the sockets of the queues, `fs` and `mm` for the memfd,
+# which is mapped into memory, `pipe` and `event` for the barrier, and `process` for the limit of
+# open file descriptors. `std` makes rustix share the types of std with its callers (`OwnedFd`,
+# `io::Error`).
+rustix = { version = "1.1.6", default-features = false, features = [
+    "event",
+    "fs",
+    "mm",
+    "net",
+    "pipe",
+    "process",
+    "std",
+] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
+# The fake service manager starts a service with the file descriptors that it passes, through
+# `dup2` between `fork` and `exec`, and tells file descriptors of one open file description apart
+# through `kcmp(2)`, as systemd does: rustix has neither.
+libc = { version = "0.2.191", optional = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The benchmarks, through CodSpeed's build of criterion, which times them as criterion does
+# elsewhere.
+criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
+# The unit tests use the fake service manager too.
+libc = "0.2.191"
+
+[[bench]]
+name = "handover"
+harness = false
+# It hands over through the fake service manager.
+required-features = ["testing"]

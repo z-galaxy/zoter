@@ -1,0 +1,190 @@
+name: CodSpeed Benchmarks
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    # `ready_for_review` too, as a draft runs no benchmarks until then.
+    types: [opened, synchronize, reopened, ready_for_review]
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
+
+# A push to a pull request makes the report of the run still going for its previous push moot,
+# so that run is cancelled rather than left to use up runner minutes. Every run on main is kept:
+# each is the baseline of the pull requests based on it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  # Lets the CodSpeed action authenticate the upload with GitHub's OIDC token instead of a secret.
+  id-token: write
+
+jobs:
+  # Whether the benchmarks are worth the macro runner for this run: they are not for a change that
+  # touches nothing that they build or run. A job of its own, on a GitHub-hosted runner, so that a
+  # run that skips them waits for no macro runner first.
+  changes:
+    name: Look for what the benchmarks measure
+    runs-on: ubuntu-latest
+    outputs:
+      measured: ${{ steps.look.outputs.measured }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # A pull request is checked out as its merge into the base branch, whose first parent is
+          # the base: what the two differ in is what the pull request changes.
+          fetch-depth: 2
+      - id: look
+        name: Look at what changed
+        env:
+          BEFORE: ${{ github.event.before }}
+          # What can't change what `handover` measures, nor how it runs: documentation and the
+          # design, the repository's settings, the other workflows, and the code of the tests, which
+          # `handover` doesn't build.
+          UNMEASURED: |-
+            \.md$
+            ^LICENSE$
+            ^docs/
+            ^\.github/
+            ^\.githooks/
+            ^tests/
+            ^release-plz\.toml$
+            ^\.(codespellrc|commitlintrc\.mjs|editorconfig|gitignore)$
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) base=HEAD^1 ;;
+            push)
+              git fetch --quiet --depth=1 origin "$BEFORE"
+              base=$BEFORE
+              ;;
+            *)
+              echo measured=true >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          changed=$(git diff --name-only "$base" HEAD)
+          # A file that matches none of the patterns of `UNMEASURED`, one to a line, is measured.
+          if grep -qvE -f <(printf '%s\n' "$UNMEASURED") <<< "$changed" ||
+            grep -qx '\.github/workflows/bench\.yml' <<< "$changed"; then
+            echo measured=true >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Nothing that the benchmarks measure changed: they don't run."
+            echo measured=false >> "$GITHUB_OUTPUT"
+          fi
+
+  # The benchmarks of `handover` pass file descriptors over unix sockets, and wait for the fake
+  # service manager, on a thread of its own, to have dealt with them: what they cost is mostly in
+  # the kernel, which CodSpeed's CPU simulation leaves out, so they are measured by the clock. On a
+  # bare-metal CodSpeed macro runner, given to them alone, so that the numbers move with the code
+  # rather than with the load of whoever shares a hosted runner's host. Keep them on this one label:
+  # two runs are only comparable when measured on the same machine.
+  #
+  # They are built on a GitHub-hosted runner of the same architecture as the macro runner, which
+  # costs nothing, and only run on the macro runner, so that the minutes of the macro runner go to
+  # running them rather than to building them. They are built in a container of the macro runner's
+  # release of Ubuntu, 22.04, rather than on a hosted runner of it, which GitHub retires in 2027:
+  # built on a later release, they are linked against a later glibc, whose symbols the 2.35 of the
+  # macro runner lacks. Renovate leaves the container's release alone, as `renovate.json` says.
+  #
+  # They aren't worth the macro runner for a draft either, which is pushed to again and again: they
+  # run once it is marked as ready for review, and for each push after that. A release changes
+  # nothing that they measure either: its pull request, which release-plz opens from a branch of its
+  # own, only bumps versions and changelogs, and so does its merge, which `release.yml` tells apart
+  # by the release emoji of its commits, as this does. The job that runs them, which needs this one,
+  # is skipped with it.
+  benchmarks:
+    name: Build benchmarks (walltime)
+    needs: changes
+    runs-on: ubuntu-26.04-arm
+    container: ubuntu:22.04
+    if: >-
+      ${{ needs.changes.outputs.measured == 'true' && !github.event.pull_request.draft &&
+      !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-')) &&
+      !(github.event_name == 'push' && contains(join(github.event.commits.*.message), '🔖')) }}
+    timeout-minutes: 30
+    steps:
+      # The image has none of these: the installer of rustup, which setup-rust runs, downloads with
+      # curl, over HTTPS; rustc links with the C compiler, which also builds the C code of
+      # CodSpeed's instrument hooks; checkout clones with git; and the cache is compressed with
+      # zstd, as on a hosted runner.
+      - name: Install what the build needs
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git zstd
+      - uses: actions/checkout@v7
+      - name: Setup rust toolchain, cache and cargo-codspeed binary
+        uses: moonrepo/setup-rust@v1
+        env:
+          # cargo-binstall looks the release of each binary up on GitHub's API, which limits
+          # requests without a token: a lookup that hit the limit once stalled a job for 8 minutes.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          channel: stable
+          cache-target: release
+          # Only main saves the cache, which pull requests restore: the cache of a pull request
+          # could only be restored by the later runs of that pull request, and would count against
+          # the repository's limit, which could push main's out.
+          cache-base: main
+          # setup-rust's cache key leaves the architecture out: without this, this arm64 job would
+          # find a cache that an x86_64 job saved under the same key, and never save its own.
+          cache-extra-identifier: ${{ runner.arch }}
+          # The major version of cargo-codspeed goes with that of codspeed-criterion-compat, which
+          # Cargo.lock pins: the two are bumped together.
+          bins: cargo-codspeed@6.0.0
+      # The benchmarks hand over through the fake service manager, behind the `testing` feature.
+      - name: Build the benchmark target
+        run: cargo codspeed build -m walltime --features testing --bench handover
+      # cargo-codspeed goes along, as the macro runner would otherwise install it too. A tarball
+      # keeps the executable bits, which an artifact drops.
+      - name: Pack the benchmarks
+        run: tar -czf walltime.tar.gz target/codspeed/walltime -C ~/.cargo/bin cargo-codspeed
+      - uses: actions/upload-artifact@v7
+        with:
+          name: walltime-benchmarks
+          path: walltime.tar.gz
+          retention-days: 1
+  walltime:
+    name: Run benchmarks (walltime)
+    needs: benchmarks
+    runs-on: codspeed-macro-arm64-graviton-ubuntu-22-04
+    # The job takes a minute or two: one that takes longer than 15 is stuck, and would hold the
+    # macro runner until GitHub's own limit of 6 hours.
+    timeout-minutes: 15
+    steps:
+      # cargo-codspeed reads the workspace with `cargo metadata`, and the benchmarks name their
+      # sources by their paths in it.
+      - uses: actions/checkout@v7
+      # The cargo of the runner's image, 1.81, can't read zoter's manifest, which is of the 2024
+      # edition. Nothing is built here, so the cache, which holds what the build of the benchmarks
+      # needs, is left out.
+      - name: Setup rust toolchain
+        uses: moonrepo/setup-rust@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          channel: stable
+          cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: walltime-benchmarks
+      - name: Unpack the benchmarks
+        run: |
+          tar -xzf walltime.tar.gz
+          install -m 755 cargo-codspeed ~/.cargo/bin/
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: walltime
+          # Nothing is ever saved to the cache of CodSpeed's instruments on the macro runner.
+          cache-instruments: false
+          # criterion's warm-up of 3 s and measurement of 5 s for each id give way to 1 s and 2 s:
+          # the numbers spread far more from one run to the next, on the machines of the macro
+          # runner, than within a run, so the longer ones bought little but minutes. No plots are
+          # drawn, as nothing reads them.
+          run: >-
+            cargo codspeed run -m walltime --bench handover --
+            --warm-up-time 1 --measurement-time 2 --noplot
