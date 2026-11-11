@@ -139,7 +139,7 @@ stops for good.
 
 ## Status
 
-In development: nothing is released yet, and the API can change at any time.
+In development: the API can change from one minor version to the next.
 
 ## License
 
