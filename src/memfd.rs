@@ -8,7 +8,8 @@ use std::{
     io,
     ops::Deref,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
-    ptr, slice,
+    ptr, slice, thread,
+    time::{Duration, Instant},
 };
 
 use rustix::{
@@ -25,6 +26,11 @@ use rustix::{
 /// this, rather than kill the process as it writes, from Linux 5.14 on. It fails with what `fill`
 /// fails with, and the memfd goes then. `name` is for debugging only: it shows as `memfd:<name>`
 /// among the files of the process, and can be 249 bytes at most.
+///
+/// Children that other threads fork meanwhile, such as to spawn processes, don't inherit the
+/// mapping. A child forked between the creation of the mapping and its `MADV_DONTFORK` still
+/// inherits it. An inherited writable mapping prevents write sealing until the child unmaps it,
+/// execs, or exits, so sealing waits for that, for 1 s at most.
 pub(crate) fn filled<F, E>(name: &str, len: usize, fill: F) -> Result<OwnedFd, E>
 where
     F: FnOnce(&mut [u8]) -> Result<(), E>,
@@ -43,8 +49,7 @@ where
     }
     // The kernel refuses to seal a memfd against writes while a shared mapping of it is left, a
     // read-only one included, so the mapping went first.
-    let seals = SealFlags::WRITE | SealFlags::SEAL;
-    fcntl_add_seals(&fd, seals).map_err(io::Error::from)?;
+    seal_writes(fd.as_fd())?;
 
     Ok(fd)
 }
@@ -142,8 +147,21 @@ impl Mapping {
     /// A shared mapping of the first `len` bytes of the memfd `fd`, to write to the memfd, which
     /// no other process has yet, nor anything else in this one, and which is sealed against
     /// shrinking, so that no one else changes what the mapping shows, and it stays as long.
+    ///
+    /// `MADV_DONTFORK` prevents children from inheriting this mapping. An inherited writable
+    /// mapping would prevent write sealing until the child unmaps it, execs, or exits.
     fn shared(fd: BorrowedFd<'_>, len: usize) -> io::Result<Self> {
-        Self::new(fd, len, true)
+        let mapping = Self::new(fd, len, true)?;
+        let len = mapping.len.get();
+        if len > 0 {
+            // SAFETY: The advice covers only the memory of the mapping, and changes none of it in
+            // this process. Children forked from now on don't have this memory. Only `fill` of
+            // `filled` could reach it in such a child: it would have to fork through `unsafe` code
+            // of its own, and then use the slice that it was lent.
+            unsafe { madvise(mapping.start.cast(), len, Advice::LinuxDontFork) }?;
+        }
+
+        Ok(mapping)
     }
 
     /// A private mapping of all of the memfd `fd`, to read, if it is sealed against shrinking and
@@ -281,17 +299,40 @@ fn new(name: &str) -> io::Result<OwnedFd> {
     }
 }
 
+/// Seal the memfd `fd` against writes, and against more seals.
+///
+/// The kernel refuses with `EBUSY` while any writable shared mapping of the memfd exists. A child
+/// that inherited one keeps it until it unmaps it, execs, or exits. On `EBUSY`, this tries again
+/// until [`SEAL_TIMEOUT`] has passed.
+fn seal_writes(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let seals = SealFlags::WRITE | SealFlags::SEAL;
+    let deadline = Instant::now() + SEAL_TIMEOUT;
+    loop {
+        match fcntl_add_seals(fd, seals) {
+            Err(Errno::BUSY) if Instant::now() < deadline => thread::sleep(SEAL_RETRY),
+            sealed => return Ok(sealed?),
+        }
+    }
+}
+
 /// How much room [`read`] makes for the next read, at least.
 const READ_CHUNK: usize = 8192;
+/// How long [`seal_writes`] keeps trying, at most.
+const SEAL_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long [`seal_writes`] waits between tries.
+const SEAL_RETRY: Duration = Duration::from_millis(1);
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::ErrorKind};
+    use std::{fs::File, io::ErrorKind, os::fd::AsRawFd};
 
-    use rustix::io::{FdFlags, fcntl_getfd, pwrite, write};
+    use rustix::{
+        io::{FdFlags, fcntl_getfd, pwrite, write},
+        process::{Pid, WaitOptions, waitpid},
+    };
 
     use super::*;
-    use crate::test_utils::read_byte;
+    use crate::test_utils::{in_own_process, pipe, read_byte};
 
     #[test]
     fn round_trip() {
@@ -404,5 +445,91 @@ mod tests {
         let bytes = read(file.as_fd()).unwrap();
         assert!(bytes.len() > READ_CHUNK);
         assert_eq!(bytes, std::fs::read(path).unwrap());
+    }
+
+    /// A child forked while the memfd is filled doesn't inherit the mapping, so sealing succeeds
+    /// while the child is still alive. The child waits before it exits, as a child that spawns a
+    /// process may wait before it execs.
+    #[test]
+    fn sealed_with_a_child_forked_as_it_was_filled() {
+        let test = "memfd::tests::sealed_with_a_child_forked_as_it_was_filled";
+        if !in_own_process(test, "ZOTER_TEST_FORK=1") {
+            return;
+        }
+
+        let (wait, release) = pipe();
+        let mut child = None;
+        let filled = filled("zoter-test", 8, |memfd: &mut [u8]| {
+            memfd.fill(1);
+            child = Some(fork_waiting(&wait, &release));
+
+            Ok::<_, io::Error>(())
+        });
+        drop(release);
+        reap(child.unwrap());
+
+        let fd = filled.unwrap();
+        assert!(fcntl_get_seals(&fd).unwrap().contains(SealFlags::WRITE));
+        assert_eq!(read(fd.as_fd()).unwrap(), [1; 8]);
+    }
+
+    /// A child that inherited a writable mapping of the memfd prevents write sealing until it
+    /// exits, and sealing waits for that. A child forked right before the mapping got its
+    /// `MADV_DONTFORK` is such a child.
+    #[test]
+    fn sealing_waits_for_a_child_with_a_copy() {
+        let test = "memfd::tests::sealing_waits_for_a_child_with_a_copy";
+        if !in_own_process(test, "ZOTER_TEST_FORK=1") {
+            return;
+        }
+
+        let fd = new("zoter-test").unwrap();
+        ftruncate(&fd, 8).unwrap();
+        let (wait, release) = pipe();
+        // Unlike the mapping of `Mapping::shared`, this one has no `MADV_DONTFORK`, so the child
+        // inherits it.
+        let mapping = Mapping::new(fd.as_fd(), 8_usize, true).unwrap();
+        let child = fork_waiting(&wait, &release);
+        drop(mapping);
+        // The child is released after a while, so that sealing first finds it still alive.
+        let releasing = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(release);
+        });
+        let sealed = seal_writes(fd.as_fd());
+        releasing.join().unwrap();
+        reap(child);
+
+        sealed.unwrap();
+        assert!(fcntl_get_seals(&fd).unwrap().contains(SealFlags::WRITE));
+    }
+
+    /// Fork a child that waits until `release` is closed, and then exits. The child reads from
+    /// `wait`, the other end of the pipe. It closes its own copy of `release` first, so it exits as
+    /// soon as the test closes its copy, even if the test fails.
+    fn fork_waiting(wait: &OwnedFd, release: &OwnedFd) -> Pid {
+        let (wait, release) = (wait.as_raw_fd(), release.as_raw_fd());
+        // SAFETY: The child calls only `close`, `read` and `_exit`. These are async-signal-safe,
+        // which is all that the child of a process with several threads may call.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let mut byte = 0_u8;
+            // SAFETY: As above. `read` reads at most 1 byte, into `byte`.
+            unsafe {
+                libc::close(release);
+                libc::read(wait, (&raw mut byte).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+
+        assert!(pid > 0, "{}", io::Error::last_os_error());
+
+        Pid::from_raw(pid).unwrap()
+    }
+
+    /// Wait for the child `pid` to exit, and check that it exited with 0.
+    fn reap(pid: Pid) {
+        let (_, status) = waitpid(Some(pid), WaitOptions::empty()).unwrap().unwrap();
+        assert_eq!(status.exit_status(), Some(0), "{status:?}");
     }
 }

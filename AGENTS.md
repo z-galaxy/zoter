@@ -79,8 +79,8 @@ benches/handover.rs # [testing feature] What storing a hand-over and taking it o
 of the state and of the items in the queues of sockets, stored under `<key>/fds`, as many as that
 takes. `Store::take_over` takes the names of its key out of `Passed`, removes them from the store
 first, maps the memfd, and takes the FDs out of the queues by their indexes. The tests that take
-FDs from 3 on, or change the environment or the limit of open FDs, run in a process of their own
-(`test_utils::in_own_process`).
+FDs from 3 on, change the environment or the limit of open FDs, or fork children that don't exec,
+run in a process of their own (`test_utils::in_own_process`).
 
 ## Development Guidelines
 

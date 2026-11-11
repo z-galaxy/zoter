@@ -50,10 +50,11 @@ pub(crate) fn is_open(fd: RawFd) -> bool {
 
 /// Whether this is the process that the test `test`, its path in the crate, runs itself in.
 ///
-/// Some tests take file descriptors from 3 on, or change the environment, which no test can do
-/// among the threads of the others, so each runs in a process of its own. A shell makes that
-/// process the way that systemd makes a service: it opens the file descriptors 3 and 4, and
-/// exports `exports`, in which `$$` is the PID of the process, which `exec` keeps. It closes 5,
+/// Some tests take file descriptors from 3 on, change the environment, or fork children that don't
+/// exec. Such a child holds all the file descriptors of the process until it exits. No test can do
+/// any of this among the threads of the others, so each runs in a process of its own. A shell
+/// makes that process the way that systemd makes a service: it opens the file descriptors 3 and 4,
+/// and exports `exports`, in which `$$` is the PID of the process, which `exec` keeps. It closes 5,
 /// which a test needs closed, as the process may inherit any descriptor that another test has open
 /// at the time and that isn't close-on-exec.
 ///
