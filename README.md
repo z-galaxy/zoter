@@ -13,6 +13,11 @@
   </a>
 </p>
 
+<p align="center">
+  <img alt="zoter logo"
+    src="https://raw.githubusercontent.com/z-galaxy/zoter/ef25fb8c4c17c9d33ada3e9b3edea7830f898774/data/logo.svg">
+</p>
+
 <h1 align="center">zoter</h1>
 
 Restart systemd services without dropping their clients.

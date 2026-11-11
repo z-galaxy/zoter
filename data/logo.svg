@@ -1,0 +1,10 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+<title>zoter logo</title>
+<circle cx="64" cy="64" r="64" fill="#CC4800"/>
+<path d="M23 44.3H105M48 44.3L32 72M65 44.3V76.3M82 44.3V76.3M99 44.3V76.3"
+  stroke="white" stroke-width="5" stroke-linecap="round"/>
+<circle cx="29" cy="77.2" r="6" stroke="white" stroke-width="5"/>
+<circle cx="65" cy="82.3" r="6" stroke="white" stroke-width="5"/>
+<circle cx="82" cy="82.3" r="6" stroke="white" stroke-width="5"/>
+<circle cx="99" cy="82.3" r="6" stroke="white" stroke-width="5"/>
+</svg>
