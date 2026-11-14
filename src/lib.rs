@@ -11,7 +11,7 @@
 mod log;
 
 mod handover;
-pub use handover::{Handover, LeftOut, Stored};
+pub use handover::{Handover, Stored};
 mod layout;
 mod limit;
 pub use limit::raise_fd_limit;

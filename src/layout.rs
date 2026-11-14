@@ -93,8 +93,8 @@ impl Layout {
 
     /// Write the header and the table into `memfd`, which is [`len`](Self::len) bytes long, and
     /// zeroed but for the records: `state_fds` is how many file descriptors the state has, and
-    /// `entries` are the items, where their records are as this layout has them, which may leave
-    /// some out, as those whose records failed to be saved.
+    /// `entries` are the items, where their records are as this layout has them, which need not be
+    /// all of those that it has a place for.
     pub(crate) fn write(&self, memfd: &mut [u8], state_fds: usize, entries: &[Entry]) {
         let fds = state_fds as u64 + entries.iter().map(Entry::fd_count).sum::<u64>();
         let mut header = Writer(&mut memfd[..HEADER_LEN]);
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(layout.len(), 216);
         let mut memfd = vec![0; layout.len()];
         memfd[layout.state()].copy_from_slice(b"state");
-        // The second item is left out, as one whose record failed to be saved.
+        // The second item has no entry, though it has a place.
         let entries = [
             Entry {
                 id: 7,

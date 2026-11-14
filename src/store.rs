@@ -13,15 +13,13 @@ use std::{
 use rustix::{
     io::fcntl_dupfd_cloexec,
     pipe::{PipeFlags, pipe_with},
-    process::{Resource, getrlimit},
 };
 
 use crate::{
-    Handover, LeftOut, Notifier, Passed, Restored, Save, Stored,
+    Handover, Notifier, Passed, Restored, Save, Stored,
     layout::{self, Entry, Layout},
     memfd,
     notifier::MAX_FDS,
-    passed::START,
     queue::{self, Queue},
     restored::Slot,
 };
@@ -53,24 +51,19 @@ use crate::{
 ///
 /// # Limits
 ///
-/// The next instance takes the file descriptors out of the queues under its soft limit of open
-/// files, which [`raise_fd_limit`](crate::raise_fd_limit) raises to the hard one, so
-/// [`Handover::store`] leaves out the items that don't fit under the limit that this process had
-/// as the store was created: those of a client that don't fit get disconnected, rather than all of
-/// them. The store keeps a few file descriptors open from its creation on, which it gives up for
-/// those that storing a hand-over opens, so that storing can't fail for want of them, however many
-/// the service has open by then.
+/// A hand-over is stored whole, or [`Handover::store`] fails: nothing predicts what fits in the
+/// next instance. The next instance takes the file descriptors out of the queues under its soft
+/// limit of open files, which [`raise_fd_limit`](crate::raise_fd_limit) raises to the hard one,
+/// and [`take_over`](Self::take_over) leaves out whole the items whose file descriptors don't all
+/// come, as [`Restored::left_out`] tells, rather than any part of one. The store keeps a few file
+/// descriptors open from its creation on, which it gives up for those that storing a hand-over
+/// opens, so that storing can't fail for want of them, however many the service has open by then.
 #[derive(Debug)]
 pub struct Store {
     notifier: Notifier,
     key: String,
     /// How many file descriptors the store takes, `$FDSTORE`.
     max: Option<usize>,
-    /// The soft limit of open file descriptors that the next instance is taken to have.
-    fd_limit: Option<u64>,
-    /// How many file descriptors systemd passed besides those of the hand-over, as `take_over`
-    /// found them: the next instance is passed them too.
-    others: usize,
     /// The file descriptors kept to give up for those that storing opens.
     reserve: Option<Reserve>,
 }
@@ -107,8 +100,6 @@ impl Store {
             notifier,
             key: key.to_owned(),
             max,
-            fd_limit: getrlimit(Resource::Nofile).current,
-            others: 0,
             reserve,
         })
     }
@@ -124,13 +115,6 @@ impl Store {
         self.max
     }
 
-    /// Set the soft limit of open file descriptors that the next instance is taken to have,
-    /// `None` for none: the one that this process had as the store was created, unless set
-    /// otherwise.
-    pub fn set_fd_limit(&mut self, limit: Option<u64>) {
-        self.fd_limit = limit;
-    }
-
     /// Take over from the previous instance: take the file descriptors stored under the key out
     /// of `passed`, remove them from the store, and read the hand-over that they hold, if any.
     ///
@@ -141,15 +125,22 @@ impl Store {
     /// service stored itself, if anything.
     ///
     /// It gives `None` if nothing was handed over, and fails with [`ErrorKind::InvalidData`] for a
-    /// hand-over that this version of zoter can't make sense of, and with
-    /// [`ErrorKind::Unsupported`] for one that a later version of zoter laid out otherwise. The
-    /// file descriptors of the hand-over close then, which disconnects the peers of the items.
-    /// The items whose file descriptors aren't all there are left out, as
-    /// [`Restored::left_out`] tells.
+    /// hand-over that this version of zoter can't make sense of, file descriptors of the state
+    /// that aren't all there included, and with [`ErrorKind::Unsupported`] for one that a later
+    /// version of zoter laid out otherwise. The file descriptors of the hand-over close then,
+    /// which disconnects the peers of the items.
+    ///
+    /// An item whose file descriptors aren't all there is left out whole, as
+    /// [`Restored::left_out`] tells, and those of its file descriptors that are there close, while
+    /// the take-over goes on with the next item. The kernel closes the file descriptors that the
+    /// process can't have, as when it has as many open as its soft limit of open files takes,
+    /// which [`raise_fd_limit`](crate::raise_fd_limit) raises to the hard one that `LimitNOFILE=`
+    /// of the service sets. The file descriptors are queued in the order of the items, so in a
+    /// hand-over of one queue socket a limit too low costs the last items; with several, the
+    /// queue sockets come in no fixed order, and so do the items that it costs.
     pub fn take_over(&mut self, passed: &mut Passed) -> io::Result<Option<Restored>> {
         let prefix = format!("{}/", self.key);
         let stored = passed.take_prefixed(&prefix);
-        self.others = passed.len();
         // More than one file descriptor may come under a name, as the queue sockets do.
         let names: BTreeSet<_> = stored.iter().map(|(name, _)| name.as_str()).collect();
         for name in names {
@@ -259,14 +250,11 @@ impl Store {
         }
     }
 
-    /// Store `state` and `items`, as [`Handover::store`] tells, with as many file descriptors
-    /// extra per item, and as many spare ones, in the next instance.
+    /// Store `state` and `items`, as [`Handover::store`] tells.
     pub(crate) fn hand_over(
         mut self,
         state: &dyn Save,
         items: &[(u64, &dyn Save)],
-        extra_fds_per_item: usize,
-        spare_fds: usize,
     ) -> io::Result<Stored> {
         // The store takes the memfd, and as many queue sockets as it has room for besides: one at
         // least, as `handover` checked.
@@ -282,31 +270,21 @@ impl Store {
                 "the state of the hand-over can't be saved",
             )
         })?;
+        let lens = items
+            .iter()
+            .map(|(id, item)| {
+                item.saved_len().ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("item {id} of the hand-over can't be saved"),
+                    )
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         let state_fds = state.fds();
-        let all = items.len();
-        let mut left_out = Vec::new();
-        let mut kept = Vec::with_capacity(all);
-        for (index, (id, item)) in items.iter().enumerate() {
-            match item.saved_len() {
-                Some(len) => kept.push(Kept {
-                    index,
-                    id: *id,
-                    item: *item,
-                    len,
-                    fds: item.fds(),
-                }),
-                None => left_out.push((index, *id, LeftOut::Unsaved)),
-            }
-        }
-        self.fit(
-            &mut kept,
-            &mut left_out,
-            state_fds.len() + spare_fds,
-            extra_fds_per_item,
-        );
+        let item_fds: Vec<_> = items.iter().map(|(_, item)| item.fds()).collect();
 
-        let layout = Layout::new(state_len, kept.iter().map(|item| item.len))?;
-        let mut failed = Vec::new();
+        let layout = Layout::new(state_len, lens.into_iter())?;
         {
             let name = self.name(STATE);
             let memfd = memfd::filled(&name, layout.len(), |memfd| -> io::Result<()> {
@@ -316,21 +294,21 @@ impl Store {
                         format!("the state of the hand-over failed to be saved: {e}"),
                     )
                 })?;
-                let mut entries = Vec::with_capacity(kept.len());
+                let mut entries = Vec::with_capacity(items.len());
                 let mut next = state_fds.len() as u64;
-                for (place, item) in kept.iter().enumerate() {
-                    let record = &mut memfd[layout.item(place)];
-                    if let Err(e) = item.item.save(record) {
-                        // What it wrote of its record goes, as the table doesn't have it.
-                        record.fill(0);
-                        failed.push((place, e));
-
-                        continue;
-                    }
+                for (place, ((id, item), fds)) in items.iter().zip(&item_fds).enumerate() {
+                    item.save(&mut memfd[layout.item(place)]).map_err(|e| {
+                        io::Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "the record of item {id} of the hand-over failed to be saved: {e}"
+                            ),
+                        )
+                    })?;
                     let first = next;
-                    next += item.fds.len() as u64;
+                    next += fds.len() as u64;
                     entries.push(Entry {
-                        id: item.id,
+                        id: *id,
                         record: layout.item(place),
                         fds: first..next,
                     });
@@ -339,121 +317,33 @@ impl Store {
 
                 Ok(())
             })?;
-            // Stored first, so that a store too small for all of the hand-over keeps what matters
-            // most.
             self.notifier.store(&name, &[memfd.as_fd()])?;
-        }
-        for (place, e) in failed.into_iter().rev() {
-            let item = kept.remove(place);
-            warn!(
-                "Leaving item {} out of the hand-over, as its record failed to be saved: {e}",
-                item.id
-            );
-            left_out.push((item.index, item.id, LeftOut::Save(e)));
         }
 
         let fds: Vec<_> = state_fds
             .iter()
+            .chain(item_fds.iter().flatten())
             .copied()
-            .chain(kept.iter().flat_map(|item| item.fds.iter().copied()))
             .collect();
         let name = self.name(FDS);
-        let (queued, failure) = queue_fds(fds.chunks(MAX_FDS), room, |socket| {
+        queue_fds(fds.chunks(MAX_FDS), room, |socket| {
             self.notifier.store(&name, &[socket.as_fd()])
         })?;
-        if queued < state_fds.len() {
-            return Err(failure.unwrap_or_else(|| {
-                io::Error::other("the store took none of the file descriptors of the state")
-            }));
-        }
-        let mut end = state_fds.len();
-        let before = kept.len();
-        kept.retain(|item| {
-            end += item.fds.len();
-            if end <= queued {
-                return true;
-            }
-            let why = match &failure {
-                Some(e) => LeftOut::Queue(e.kind()),
-                None => LeftOut::Store,
-            };
-            left_out.push((item.index, item.id, why));
-
-            false
-        });
-        if kept.len() < before {
-            let why = match &failure {
-                Some(e) => format!("queueing their file descriptors failed: {e}"),
-                None => "the file descriptor store takes no more sockets of their file \
-                         descriptors: raise `FileDescriptorStoreMax=` of the service"
-                    .to_owned(),
-            };
-            warn!("Handing over {} of the {all} items, as {why}.", kept.len());
-        }
 
         // The service manager ties what it gets to the service by the process that sent it, which
         // goes next.
         self.notifier.barrier(BARRIER_TIMEOUT)?;
         debug!(
-            "Stored {} items and {queued} file descriptors under `{}` for the next instance",
-            kept.len(),
+            "Stored {} items and {} file descriptors under `{}` for the next instance",
+            items.len(),
+            fds.len(),
             self.key
         );
-        left_out.sort_by_key(|(index, _, _)| *index);
 
         Ok(Stored {
-            items: kept.len(),
-            fds: queued,
-            left_out: left_out.into_iter().map(|(_, id, why)| (id, why)).collect(),
+            items: items.len(),
+            fds: fds.len(),
         })
-    }
-
-    /// Keep the items of `kept` that fit, in order, under the soft limit of open file descriptors
-    /// that the next instance is taken to have, if any, with `reserved` of them reserved besides,
-    /// and leave the others out, to `left_out`.
-    ///
-    /// Each item takes its file descriptors, and `extra` more in the next instance. One that
-    /// doesn't fit is left out whole, as the next instance couldn't make anything of it without all
-    /// of its file descriptors, while those after it, of fewer, may still fit.
-    fn fit(
-        &self,
-        kept: &mut Vec<Kept<'_>>,
-        left_out: &mut Vec<(usize, u64, LeftOut)>,
-        reserved: usize,
-        extra: usize,
-    ) {
-        let Some(limit) = self.fd_limit.and_then(|limit| usize::try_from(limit).ok()) else {
-            return;
-        };
-        let all = kept.len();
-        // The next instance has the standard input, output and error open, the other file
-        // descriptors that systemd passes it, the memfd and the queue sockets, as many as the store
-        // takes at most, and `reserved`.
-        let taken = START as usize + self.others + self.max.unwrap_or(0) + reserved;
-        let mut room = limit.saturating_sub(taken);
-        kept.retain(|item| {
-            let left = item
-                .fds
-                .len()
-                .checked_add(extra)
-                .and_then(|needed| room.checked_sub(needed));
-            let Some(left) = left else {
-                left_out.push((item.index, item.id, LeftOut::FdLimit));
-
-                return false;
-            };
-            room = left;
-
-            true
-        });
-        if kept.len() < all {
-            warn!(
-                "Handing over {} of the {all} items that can be, as the next instance takes their \
-                 file descriptors under its limit of open file descriptors, {limit} as this one \
-                 has it: raise the hard limit of `LimitNOFILE=` of the service.",
-                kept.len()
-            );
-        }
     }
 
     /// The name that the store keeps the file descriptors of the hand-over that `kind` tells
@@ -461,17 +351,6 @@ impl Store {
     fn name(&self, kind: &str) -> String {
         format!("{}/{kind}", self.key)
     }
-}
-
-/// An item of a hand-over that is to be stored, as far as it fits.
-struct Kept<'h> {
-    /// Its place among the items of the hand-over.
-    index: usize,
-    id: u64,
-    item: &'h dyn Save,
-    /// How long its record is.
-    len: usize,
-    fds: Vec<BorrowedFd<'h>>,
 }
 
 /// File descriptors that a store keeps from its creation on, to give up for those that storing a
@@ -497,54 +376,60 @@ impl Reserve {
 }
 
 /// Queue the file descriptors of `chunks`, in order, each chunk as one datagram, in queue sockets,
-/// as many as that takes, `room` at most, and hand each one that took any datagram to `store`,
-/// once it took all that it takes. Tell how many file descriptors that queued, and why not all of
-/// them, if not: queueing failed, or else, `room` queue sockets took no more.
-fn queue_fds<'c, 'f, C, S>(
-    chunks: C,
-    room: usize,
-    mut store: S,
-) -> io::Result<(usize, Option<io::Error>)>
+/// as many as that takes, `room` at most, and hand each one to `store`, once it took all that it
+/// takes.
+///
+/// It fails with [`ErrorKind::StorageFull`] if `room` queue sockets don't take all of them, and
+/// with the error of queueing them if that fails. The queue sockets that `store` got by then stay
+/// stored.
+fn queue_fds<'c, 'f, C, S>(chunks: C, room: usize, mut store: S) -> io::Result<()>
 where
     'f: 'c,
     C: IntoIterator<Item = &'c [BorrowedFd<'f>]>,
     S: FnMut(OwnedFd) -> io::Result<()>,
 {
     let mut chunks = chunks.into_iter().peekable();
-    let mut queued = 0;
+    let mut index = 0;
     for _ in 0..room {
         if chunks.peek().is_none() {
-            break;
+            return Ok(());
         }
         let queue = Queue::new()?;
         let mut took = false;
-        let mut failure = None;
         while let Some(chunk) = chunks.peek() {
-            match queue.push(queued as u64, chunk) {
-                Ok(true) => queued += chunk.len(),
+            let pushed = queue.push(index, chunk).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("the file descriptors of the hand-over failed to be queued: {e}"),
+                )
+            })?;
+            if !pushed {
                 // The next queue takes the rest.
-                Ok(false) => break,
-                Err(e) => {
-                    failure = Some(e);
-
-                    break;
-                }
+                break;
             }
+            index += chunk.len() as u64;
             took = true;
             chunks.next();
         }
-        if took {
-            store(queue.into_socket())?;
-        } else if failure.is_none() {
+        if !took {
             // Any other queue would take none either.
-            failure = Some(io::Error::other("a socket took none of them"));
+            return Err(io::Error::other(
+                "a queue socket took none of the file descriptors of the hand-over",
+            ));
         }
-        if failure.is_some() {
-            return Ok((queued, failure));
-        }
+        store(queue.into_socket())?;
+    }
+    if chunks.peek().is_none() {
+        return Ok(());
     }
 
-    Ok((queued, None))
+    Err(io::Error::new(
+        ErrorKind::StorageFull,
+        format!(
+            "the file descriptor store takes too few file descriptors for those of the hand-over, \
+             {room} queue sockets besides the memfd: raise `FileDescriptorStoreMax=` of the service"
+        ),
+    ))
 }
 
 /// The file descriptors out of the queue sockets that hold them, `queues`, as [`queue::take`]

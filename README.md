@@ -38,8 +38,9 @@ D-Bus or Varlink:
 * [`Store`] hands the service over to its next instance. In the instance that stops,
   [`Store::handover`] starts a [`Handover`], and [`Handover::store`] stores the state of the service
   and items, such as the connections of its clients, each a record of bytes and file descriptors,
-  within the limits of systemd and of the next instance, however many there are. In the next
-  instance, [`Store::take_over`] takes them over, as a [`Restored`].
+  however many there are. In the next instance, [`Store::take_over`] takes them over, as a
+  [`Restored`]. A hand-over is stored whole, or storing fails, and an item that doesn't come whole
+  to the next instance, as when it has too many files open, is left out whole, and listed.
 
 A protocol takes part through two traits, [`Save`] and [`Restore`], which the hand-overs of its
 connections implement, so that a service hands those over as they are. The `testing` feature adds
@@ -58,7 +59,7 @@ use zoter::{Passed, Store};
 
 fn main() -> io::Result<()> {
     // The next instance takes the file descriptors of a hand-over out of the store under this
-    // limit.
+    // limit, and leaves out the clients whose file descriptors don't fit.
     zoter::raise_fd_limit()?;
     // SAFETY: No other thread runs yet, so none reads or writes the environment meanwhile, and
     // nothing took the file descriptors that systemd passed.
@@ -78,6 +79,10 @@ fn main() -> io::Result<()> {
     let mut clients: Vec<(u64, OwnedFd)> = Vec::new();
     if let Some(mut restored) = restored {
         let _state = restored.state();
+        // Those whose file descriptors didn't all come, as when this instance has too many open.
+        for id in restored.left_out() {
+            eprintln!("Client {id} was left out");
+        }
         for item in restored.take_items() {
             let id = item.id;
             clients.push((id, item.restore()?));
@@ -102,12 +107,9 @@ fn main() -> io::Result<()> {
             return Ok(());
         }
     };
-    // Stop taking requests, finish those taken, and hand the state and the clients over.
+    // Stop taking requests, finish those taken, and hand the state and all of the clients over.
     let clients = clients.iter().map(|(id, client)| (*id, client));
-    let stored = handover.store(b"the state".to_vec(), clients)?;
-    for (id, why) in stored.left_out() {
-        eprintln!("Client {id} was left out: {why}");
-    }
+    handover.store(b"the state".to_vec(), clients)?;
 
     Ok(())
 }

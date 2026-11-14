@@ -47,9 +47,11 @@ stores under, the layout of the memfd, busd's state and zbus's API can all chang
   service hands those over as they are, and so that each protocol has one API for its records.
 - Keep what busd learnt: the FDs of a hand-over go in queue sockets (so the store takes any
   number of them, each FD as it is, and `$LISTEN_FDNAMES` stays short, z-galaxy/busd#438); the
-  state is in one sealed memfd that is written and read in place; the items that don't fit under
-  the limit of open FDs of the next instance are left out whole; storing can't fail for want of
-  FDs; the next instance removes what it takes from the store before anything else.
+  state is in one sealed memfd that is written and read in place; storing can't fail for want of
+  FDs; the next instance removes what it takes from the store before anything else. All but
+  busd's fitting of its clients under the limit of open FDs of the next instance, which left out
+  those that didn't fit: a hand-over is stored whole, or storing fails, and the next instance
+  leaves out, and lists, the items whose FDs didn't all come to it (see "Decisions").
 - One API for every runtime: it is synchronous, and blocks only at exit, as the barrier waits for
   the service manager. Pausing a server, and timing it out, is the async work of its caller,
   which zbus and zlink do for their services.
@@ -125,7 +127,7 @@ async fn serve(mut passed: zoter::Passed) -> io::Result<()> {
     let (state, connections) = server.pause().await?;
     // Lays the hand-over out in the store, waits for systemd to have dealt with it, and returns.
     let items = connections.iter().map(|(id, connection)| (*id, connection));
-    let stored = handover.store(state.encode(), items)?;
+    handover.store(state.encode(), items)?;
 
     Ok(())
 }
@@ -148,7 +150,7 @@ systemd is.
 /// What can be handed over: a record of bytes, and the FDs that go with it.
 pub trait Save {
     /// The exact length of the record, or `None` for what can't be saved, as the hand-over of a
-    /// connection over a socket that only goes on in this process: a hand-over leaves it out.
+    /// connection over a socket that only goes on in this process: a hand-over of it fails.
     fn saved_len(&self) -> Option<usize>;
     /// Copy the record into `dest`, which is `saved_len` bytes long, at any address, such as its
     /// place in a memfd mapped into memory.
@@ -230,7 +232,7 @@ stay strings (`"READY=1"`, `"STOPPING=1"`, `"EXTEND_TIMEOUT_USEC=…"`); typed o
 /// hand-over opens, so that storing can't fail for want of FDs, however many the service has open
 /// by then.
 #[derive(Debug)]
-pub struct Store { /* notifier, key, $FDSTORE, the FD limit, the reserved FDs */ }
+pub struct Store { /* notifier, key, $FDSTORE, the reserved FDs */ }
 
 impl Store {
     /// The store of the service that `$NOTIFY_SOCKET` names, taking `$FDSTORE` FDs, if set.
@@ -240,11 +242,10 @@ impl Store {
     pub fn notifier(&self) -> &Notifier;
     /// How many FDs the store takes, as `FileDescriptorStoreMax=` of the unit sets it.
     pub fn max(&self) -> Option<usize>;
-    /// The soft limit of open FDs that the next instance is taken to have, `None` for none: the
-    /// one that this process had as the store was created, unless set otherwise.
-    pub fn set_fd_limit(&mut self, limit: Option<u64>);
     /// Take over from the previous instance: take the FDs stored under the key out of `passed`,
-    /// remove them from the store, and read the hand-over that they hold, if any.
+    /// remove them from the store, and read the hand-over that they hold, if any: it fails with
+    /// `ErrorKind::InvalidData` if FDs of the state are missing, and leaves out whole the items
+    /// whose FDs aren't all there, as `Restored::left_out` tells.
     pub fn take_over(&mut self, passed: &mut Passed) -> io::Result<Option<Restored>>;
     /// Start a hand-over to the next instance: it fails with `ErrorKind::Unsupported` if the
     /// store can't take one (the state memfd and a queue socket), saying why, and which setting
@@ -261,15 +262,9 @@ hand-over that the next instance fails on, or crashes on, isn't found by the one
 ```rust
 /// A hand-over to the next instance, which `Store::handover` started.
 #[derive(Debug)]
-pub struct Handover { /* the store, the rules of fitting the items */ }
+pub struct Handover { /* the store */ }
 
 impl Handover {
-    /// How many FDs each item takes in the next instance besides those that it hands over, such
-    /// as the pidfd of the peer of a connection that busd opens: none, unless set.
-    pub fn set_extra_fds_per_item(&mut self, count: usize);
-    /// How many FDs the next instance keeps free, besides the items, for those that it opens of
-    /// its own as it starts: 32, as busd has it, unless set.
-    pub fn set_spare_fds(&mut self, count: usize);
     pub fn notifier(&self) -> &Notifier;
     /// Store `state`, and `items`, each under an id that the crate doesn't look at, so that the
     /// state can refer to it, for the next instance, and wait for systemd to have dealt with it.
@@ -286,33 +281,17 @@ hand over, and gives the state and the items to `store` once it stopped: a hand-
 from its start would hold borrows of what the service makes later, which its drop would outlive.
 Items of different types go as `&dyn Save` or `Box<dyn Save>`.
 
-`store` fits the items under the limit of open FDs of the next instance, in order, leaving out
-whole those that don't fit, as busd's `fit` does. An item that can't be saved, or whose `save`
-fails, is left out alone. What was left out, and why, is in the `Stored` that it returns:
+`store` stores the state and every item, or fails: with `ErrorKind::InvalidInput` if the state
+or an item can't be saved, or its `save` fails, naming the id of the item, before anything is
+stored; with `ErrorKind::StorageFull` if the FDs don't fit in the store, naming
+`FileDescriptorStoreMax=`; and with the error of queueing the FDs or of storing them. It predicts
+nothing of the next instance, whose limit of open FDs the caller would otherwise have to describe,
+FDs that it opens later included. What was stored is in the `Stored` that it returns:
 
 ```rust
 #[derive(Debug)]
-pub struct Stored { /* how many items and FDs were stored, which items were left out and why */ }
-
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum LeftOut {
-    /// It can't be saved: its `saved_len` is `None`.
-    Unsaved,
-    /// Its record failed to be saved.
-    Save(io::Error),
-    /// Its FDs don't fit under the limit of open FDs of the next instance.
-    FdLimit,
-    /// Its FDs didn't fit in the store.
-    Store,
-    /// Its FDs failed to be queued, with an error of this kind.
-    Queue(io::ErrorKind),
-}
+pub struct Stored { /* how many items and FDs were stored */ }
 ```
-
-Nothing is stored of an item that is left out, so its peer is disconnected once its FDs close:
-as `store` returns, for an item that it was given by value, and as the caller drops it, for
-one that it was given by reference. busd disconnects the clients that don't fit so.
 
 ### `Restored`: what the previous instance handed over
 
@@ -327,7 +306,7 @@ impl Restored {
     pub fn take_state_fds(&mut self) -> Vec<OwnedFd>;
     /// The items whose FDs are all there, in the order that they were handed over.
     pub fn take_items(&mut self) -> impl Iterator<Item = RestoredItem<'_>>;
-    /// The ids of the items whose FDs are not all there, which are left out.
+    /// The ids of the items whose FDs are not all there, which are left out, in that order.
     pub fn left_out(&self) -> &[u64];
 }
 
@@ -352,9 +331,10 @@ impl RestoredItem<'_> {
 pub fn raise_fd_limit() -> io::Result<Option<u64>>;
 ```
 
-The next instance takes the FDs of a hand-over out of the queue sockets under its soft limit, and
-the kernel closes those that don't fit, so it raises the limit first; `Handover::store` fits the
-items under the limit that this instance had, which it takes the next one to have too.
+The next instance takes the FDs of a hand-over out of the queue sockets under its soft limit, the
+kernel closes those that don't fit, and `take_over` leaves out the items that they were of, so it
+raises the limit first. The hard limit, `LimitNOFILE=` of the service, bounds how many it can
+take.
 
 ## What the store holds
 
@@ -391,8 +371,7 @@ in it. The queue sockets hold them in datagrams of up to 253 (`SCM_MAX_FD`), eac
 its first FD, so the order of the queue sockets doesn't matter, and each takes some 70000 FDs with
 the default size of its send buffer. The store keeps one FD of each open file description, while a
 queue keeps each FD as it is, so two FDs of one file, such as one that a client sent twice, go to
-the next instance as two. The memfd is stored first, so that a store too small for all of it keeps
-the part that matters most.
+the next instance as two. The memfd is stored first, then the queue sockets.
 
 ## When things fail
 
@@ -401,22 +380,30 @@ Taking over:
 - No `<key>/state`: nothing was handed over (`Ok(None)`), and queue sockets without it are closed.
 - A memfd that isn't a hand-over, or of a later major version: an error, and every FD of the
   hand-over is closed, which disconnects the peers. They are out of the store already.
+- FDs of the state that aren't all there: `ErrorKind::InvalidData`, and every FD of the
+  hand-over is closed.
 - An item whose FDs aren't all there, as when the kernel closed those over the limit of open FDs
-  of the process: left out, in `Restored::left_out`, with a warning that names `LimitNOFILE=`.
+  of the process: left out whole, in `Restored::left_out`, its FDs that came closed, with a
+  warning that names `LimitNOFILE=` where the kernel closed FDs, and the take-over goes on with
+  the next item. Recovering one item is all or nothing; recovering the hand-over is not.
 - FDs that no item has: closed.
 
 Handing over:
 
 - The store can't take a hand-over (no `$FDSTORE`, or fewer than 2): `Store::handover` fails with
   `ErrorKind::Unsupported`, before the service paused, which shuts down instead.
-- Items that can't be saved, items over the limit of open FDs, items whose `save` fails, and items
-  whose FDs don't fit in the store (`FileDescriptorStoreMax=` too low) or fail to be queued: left
-  out, in `Stored`, with a warning that names the setting of the unit to raise, if any.
+- A state or an item that can't be saved, or whose `save` fails: `ErrorKind::InvalidInput`, and
+  nothing is stored.
 - Creating, filling or storing the memfd fails: an error, and all of the hand-over is dropped.
+- FDs that don't fit in the store (`FileDescriptorStoreMax=` too low): `ErrorKind::StorageFull`,
+  with a message that names the setting. FDs that fail to be queued or stored: that error. What
+  was stored by then stays in the store, the memfd among it, and the next instance takes over the
+  items of it that came whole, leaves out the others, and removes all of it.
 - systemd takes longer than 5 s to deal with the messages: `ErrorKind::TimedOut`.
 
 The warnings go through `tracing`, behind a default feature of the same name, as zbus and zruntime
-have it; the counts and ids are in `Stored` and `Restored` for the caller to log its own way.
+have it; the counts are in `Stored`, and the errors say what failed, for the caller to log its own
+way.
 
 ## Testing
 
@@ -509,9 +496,9 @@ With a feature on Linux, with `std`, as the hand-over of zbus is:
   `RestoredItem::restore::<connection::Handover>`, by id, and listens on the one socket of socket
   activation left in `Passed`. `Bus::hand_over_to_systemd` keeps busd's own rule (no hand-over
   without socket activation) and timeout, and stores each client's `connection::Handover` under
-  its id, with one extra FD per client (its pidfd), through `Handover::store`. `queue`,
-  `take_queued`, `take_fds`, `bytes_at`, `fit`, `Reserve`, `StoredFds` and their constants go to
-  the crate. Its module docs keep what is the bus's, and point to the crate's for the rest.
+  its id, through `Handover::store`. `queue`, `take_queued`, `take_fds`, `bytes_at`, `Reserve`,
+  `StoredFds` and their constants go to the crate, and `fit` goes. Its module docs keep what is
+  the bus's, and point to the crate's for the rest.
 - The state loses `Stored` (where each record and its FDs are), which the crate's table says now,
   and its version goes to 2. The stored names become `busd/state` and `busd/fds`.
 - The in-process hand-over (`Bus::hand_over`, then `Bus::take_over`), which the tests and the
@@ -537,6 +524,15 @@ restarts. It is free on crates.io, and its repository is `z-galaxy/zoter`.
 6. Warnings go through `tracing`, a default feature.
 7. zlink closes the connections whose replies stream, and the upgraded ones, as it hands over,
    rather than wait for them: a later version can let a service hand them over.
+8. A hand-over is stored whole or `Handover::store` fails. The first version fitted the items
+   under the limit of open FDs of the next instance, with the FDs that each would open there and
+   those to keep spare described by the caller (`set_extra_fds_per_item`, `set_spare_fds`,
+   `Store::set_fd_limit`), and left out what didn't fit or couldn't be saved (`Stored::left_out`,
+   `LeftOut`). That went: a caller can't well describe FDs that it opens later, and clients that
+   are dropped silently are a footgun, where an error says which setting to raise. Taking over
+   stays as it was: recovering one item is all or nothing, and an item whose FDs didn't all come
+   is left out whole and listed in `Restored::left_out`, for the service to log which failed,
+   while the others are taken over.
 
 ## The plan
 

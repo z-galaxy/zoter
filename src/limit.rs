@@ -8,10 +8,10 @@ use rustix::process::{Resource, getrlimit, setrlimit};
 /// and give the soft limit that it has then, `None` for none.
 ///
 /// The next instance of a service takes the file descriptors of a hand-over out of the store under
-/// its soft limit, and the kernel closes those that don't fit, so it raises its limit first, before
-/// [`Store::take_over`](crate::Store::take_over). [`Handover::store`](crate::Handover::store)
-/// fits the items of a hand-over under the soft limit that this instance had as its store was
-/// created, which it takes the next one to have too: raise it before that.
+/// its soft limit, the kernel closes those that don't fit, and
+/// [`Store::take_over`](crate::Store::take_over) leaves out the items whose file descriptors don't
+/// all come, so it raises its limit first, before that. The hard limit, which `LimitNOFILE=` of
+/// the service sets, bounds how many it can take.
 ///
 /// The soft limit that systemd sets, 1024, holds a service to a few hundred clients, while the hard
 /// one, 524288 under systemd, holds plenty. A process that waits on its file descriptors with
