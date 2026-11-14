@@ -89,3 +89,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check documentation build
         run: cargo --locked doc --all-features
+
+  semver-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
