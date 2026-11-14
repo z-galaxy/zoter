@@ -47,7 +47,9 @@ use crate::{
 /// the hand-over takes few of its file descriptors, and few names in `$LISTEN_FDNAMES`, which Linux
 /// takes 128 KiB of at most, however many file descriptors it holds. The store keeps one file
 /// descriptor of each open file description, while a queue keeps each as it is, so two of one file,
-/// such as one that a client sent twice, go to the next instance as two.
+/// such as one that a client sent twice, go to the next instance as two. The memfd is stored last,
+/// once the file descriptors are, so that the store has no hand-over in it, but for queue sockets
+/// that the next instance closes, until all of it is there.
 ///
 /// # Limits
 ///
@@ -259,9 +261,9 @@ impl Store {
         // The store takes the memfd, and as many queue sockets as it has room for besides: one at
         // least, as `handover` checked.
         let room = self.max.unwrap_or(MIN_STORE) - 1;
-        // The file descriptors kept from the start are given up for those that storing opens, each
-        // closed before the next opens: the memfd, the two ends of each pair whose one end is a
-        // queue socket, and the two ends of the pipe of the barrier.
+        // The file descriptors kept from the start are given up for those that storing opens, 3 at
+        // most at a time: the memfd, with the two ends of each pair whose one end is a queue
+        // socket, and then the two ends of the pipe of the barrier.
         self.reserve = None;
 
         let state_len = state.saved_len().ok_or_else(|| {
@@ -285,9 +287,14 @@ impl Store {
         let item_fds: Vec<_> = items.iter().map(|(_, item)| item.fds()).collect();
 
         let layout = Layout::new(state_len, lens.into_iter())?;
+        let fds: Vec<_> = state_fds
+            .iter()
+            .chain(item_fds.iter().flatten())
+            .copied()
+            .collect();
         {
-            let name = self.name(STATE);
-            let memfd = memfd::filled(&name, layout.len(), |memfd| -> io::Result<()> {
+            let state_name = self.name(STATE);
+            let memfd = memfd::filled(&state_name, layout.len(), |memfd| -> io::Result<()> {
                 state.save(&mut memfd[layout.state()]).map_err(|e| {
                     io::Error::new(
                         ErrorKind::InvalidInput,
@@ -317,18 +324,14 @@ impl Store {
 
                 Ok(())
             })?;
-            self.notifier.store(&name, &[memfd.as_fd()])?;
+            let name = self.name(FDS);
+            queue_fds(fds.chunks(MAX_FDS), room, |socket| {
+                self.notifier.store(&name, &[socket.as_fd()])
+            })?;
+            // Stored last, so that a hand-over that fails before then leaves only queue sockets in
+            // the store, which the next instance takes nothing over from.
+            self.notifier.store(&state_name, &[memfd.as_fd()])?;
         }
-
-        let fds: Vec<_> = state_fds
-            .iter()
-            .chain(item_fds.iter().flatten())
-            .copied()
-            .collect();
-        let name = self.name(FDS);
-        queue_fds(fds.chunks(MAX_FDS), room, |socket| {
-            self.notifier.store(&name, &[socket.as_fd()])
-        })?;
 
         // The service manager ties what it gets to the service by the process that sent it, which
         // goes next.
@@ -358,8 +361,9 @@ impl Store {
 /// spare.
 #[derive(Debug)]
 struct Reserve {
-    /// For what storing opens, in turn, each closed before the next opens: the memfd, the two ends
-    /// of each pair whose one end is a queue socket, and the two ends of the pipe of the barrier.
+    /// For what storing opens, 3 at most at a time: the memfd, which stays open while the two ends
+    /// of each pair whose one end is a queue socket open and close in turn, and then the two ends
+    /// of the pipe of the barrier, once the memfd closed.
     _storing: [OwnedFd; 3],
 }
 

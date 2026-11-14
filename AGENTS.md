@@ -75,12 +75,15 @@ tests/restart.rs   # [testing feature] A restart end to end: the test binary is 
 benches/handover.rs # [testing feature] What storing a hand-over and taking it over cost
 ```
 
-`Handover::store` lays a hand-over out in one memfd, stored under `<key>/state`, and puts the FDs
-of the state and of the items in the queues of sockets, stored under `<key>/fds`, as many as that
-takes. `Store::take_over` takes the names of its key out of `Passed`, removes them from the store
-first, maps the memfd, and takes the FDs out of the queues by their indexes. The tests that take
-FDs from 3 on, change the environment or the limit of open FDs, or fork children that don't exec,
-run in a process of their own (`test_utils::in_own_process`).
+`Handover::store` lays a hand-over out in one memfd, puts the FDs of the state and of the items in
+the queues of sockets, stored under `<key>/fds`, as many as that takes, and stores the memfd last,
+under `<key>/state`, so that a hand-over that fails to be stored leaves none that the next instance
+takes over. `Store::take_over` takes the names of its key out of `Passed`, removes them from the
+store first, maps the memfd, and takes the FDs out of the queues by their indexes, leaving out the
+items whose FDs aren't all there (`Restored::left_out`). The tests that take FDs from 3 on, change
+the environment or the limit of open FDs, or fork children that don't exec, run in a process of
+their own (`test_utils::in_own_process`). The service of `tests/restart.rs` hands over with no FD
+free but those that the store reserves for it.
 
 ## Development Guidelines
 

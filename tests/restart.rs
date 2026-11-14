@@ -7,6 +7,7 @@
 
 use std::{
     env,
+    fs::{self, File},
     io::{self, BufRead, BufReader, Read, Write},
     os::{
         fd::{AsFd, OwnedFd},
@@ -17,6 +18,10 @@ use std::{
     time::Duration,
 };
 
+use rustix::{
+    io::Errno,
+    process::{Resource, getrlimit, setrlimit},
+};
 use zoter::{Passed, Store, testing::Manager};
 
 /// A client connects to a service, which hands it over to its next instance as it stops, with the
@@ -43,7 +48,8 @@ fn restart() {
     client.write_all(b"a\n").unwrap();
     assert_eq!(read_line(&mut replies), "1:a");
     stop(&mut first);
-    assert_eq!(manager.stored_names(), ["echo/state", "echo/fds"]);
+    // The memfd of the hand-over goes last.
+    assert_eq!(manager.stored_names(), ["echo/fds", "echo/state"]);
 
     client.write_all(b"b\n").unwrap();
     let mut second = spawn(&manager);
@@ -56,7 +62,8 @@ fn restart() {
 
 /// Serve as the service: take over from the previous instance, if any, or else accept a client,
 /// and answer its request with the count of those answered. Then hand the client over to the next
-/// instance once the standard input ends, as this one stops.
+/// instance once the standard input ends, as this one stops, with no file descriptor free but
+/// those that the store keeps for it.
 fn serve() {
     // SAFETY: The test runs in a process of its own, whose other threads don't read or write the
     // environment, and where nothing took the file descriptors that the manager passed.
@@ -89,12 +96,46 @@ fn serve() {
 
     // The standard input ends as the test stops this instance.
     io::stdin().read_to_end(&mut Vec::new()).unwrap();
+    let _taken = no_free_fds();
     let handover = store.handover().unwrap();
     let state = count.to_le_bytes();
     let stored = handover
         .store(&state[..], [(CLIENT, client.as_fd())])
         .unwrap();
     assert_eq!((stored.items(), stored.fds()), (1, 1));
+}
+
+/// Lower the soft limit of open file descriptors of the process to just above the highest that it
+/// has open, as a process that has as many open as its limit takes has it, and take those that are
+/// free under it still, so that it can open no more, for as long as what this gives is kept.
+fn no_free_fds() -> Vec<File> {
+    // The handle of the directory is among those that it lists, and those under the limit that
+    // close are taken below.
+    let highest = fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .max()
+        .unwrap();
+    let mut limit = getrlimit(Resource::Nofile);
+    limit.current = Some(highest + 1);
+    setrlimit(Resource::Nofile, limit).unwrap();
+
+    let mut taken = Vec::new();
+    loop {
+        match File::open("/dev/null") {
+            Ok(file) => taken.push(file),
+            Err(e) if e.raw_os_error() == Some(Errno::MFILE.raw_os_error()) => return taken,
+            Err(e) => panic!("{e}"),
+        }
+    }
 }
 
 /// Start the service, as the manager does.

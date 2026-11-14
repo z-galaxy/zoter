@@ -39,11 +39,12 @@ impl Handover {
     /// descriptors don't fit in the store, which is to take more with `FileDescriptorStoreMax=` of
     /// the service, and with any I/O error of storing the memfd or the file descriptors, or of
     /// queueing them for the store. If systemd takes longer than 5 s to deal with what was stored,
-    /// it fails with [`ErrorKind::TimedOut`](io::ErrorKind::TimedOut). A hand-over that fails once
-    /// the memfd was stored may leave part of it in the store: the next instance takes over the
-    /// items of it whose file descriptors came whole, leaves out the others, as
-    /// [`Restored::left_out`](crate::Restored::left_out) tells, and removes all of it from the
-    /// store, as it does any other.
+    /// it fails with [`ErrorKind::TimedOut`](io::ErrorKind::TimedOut).
+    ///
+    /// The memfd of the hand-over is stored last, after the file descriptors, so a hand-over that
+    /// fails before then leaves only sockets of its file descriptors in the store, which the next
+    /// instance takes nothing over from, and removes. One that times out once the memfd was stored
+    /// can still be taken over, whole.
     pub fn store<S, I, T>(self, state: S, items: I) -> io::Result<Stored>
     where
         S: Save,

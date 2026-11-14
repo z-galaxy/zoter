@@ -39,7 +39,8 @@ fn round_trip() {
         .unwrap();
     assert_eq!(stored.items(), 4);
     assert_eq!(stored.fds(), 1 + 1 + MAX_FDS + 10 + 2);
-    assert_eq!(manager.stored_names(), ["test/state", "test/fds"]);
+    // The memfd goes last, so that a hand-over that fails before then isn't taken over.
+    assert_eq!(manager.stored_names(), ["test/fds", "test/state"]);
 
     let mut passed = manager.passed().unwrap();
     let mut second = store(&manager);

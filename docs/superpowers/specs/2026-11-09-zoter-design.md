@@ -371,7 +371,8 @@ in it. The queue sockets hold them in datagrams of up to 253 (`SCM_MAX_FD`), eac
 its first FD, so the order of the queue sockets doesn't matter, and each takes some 70000 FDs with
 the default size of its send buffer. The store keeps one FD of each open file description, while a
 queue keeps each FD as it is, so two FDs of one file, such as one that a client sent twice, go to
-the next instance as two. The memfd is stored first, then the queue sockets.
+the next instance as two. The memfd is stored last, after the queue sockets: until it is there, the
+store holds no hand-over, as queue sockets without it are closed.
 
 ## When things fail
 
@@ -396,10 +397,11 @@ Handing over:
   nothing is stored.
 - Creating, filling or storing the memfd fails: an error, and all of the hand-over is dropped.
 - FDs that don't fit in the store (`FileDescriptorStoreMax=` too low): `ErrorKind::StorageFull`,
-  with a message that names the setting. FDs that fail to be queued or stored: that error. What
-  was stored by then stays in the store, the memfd among it, and the next instance takes over the
-  items of it that came whole, leaves out the others, and removes all of it.
-- systemd takes longer than 5 s to deal with the messages: `ErrorKind::TimedOut`.
+  with a message that names the setting. FDs that fail to be queued or stored: that error. The
+  queue sockets stored by then stay in the store, without the memfd, which goes last, so the next
+  instance takes nothing over from them, and removes them.
+- systemd takes longer than 5 s to deal with the messages: `ErrorKind::TimedOut`. All of the
+  hand-over was sent by then, and the next instance may still take it over, whole.
 
 The warnings go through `tracing`, behind a default feature of the same name, as zbus and zruntime
 have it; the counts are in `Stored`, and the errors say what failed, for the caller to log its own
