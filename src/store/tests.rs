@@ -4,7 +4,10 @@ use std::{
     os::fd::{AsFd, OwnedFd},
 };
 
-use rustix::io::{read, write};
+use rustix::{
+    io::{read, write},
+    process::{Resource, getrlimit, setrlimit},
+};
 
 use super::*;
 use crate::{
@@ -36,7 +39,6 @@ fn round_trip() {
         .unwrap();
     assert_eq!(stored.items(), 4);
     assert_eq!(stored.fds(), 1 + 1 + MAX_FDS + 10 + 2);
-    assert!(stored.left_out().is_empty(), "{stored:?}");
     assert_eq!(manager.stored_names(), ["test/state", "test/fds"]);
 
     let mut passed = manager.passed().unwrap();
@@ -52,7 +54,6 @@ fn round_trip() {
     write(&fd, b"b").unwrap();
     assert_eq!(read_byte(&read_b), b'b');
     assert!(restored.take_state_fds().is_empty());
-    assert!(restored.left_out().is_empty());
     let mut items = restored.take_items();
     let item = items.next().unwrap();
     assert_eq!(item.id, 1);
@@ -123,69 +124,34 @@ fn no_take_over_of_garbage() {
     assert_eq!(names, ["other/state"]);
 }
 
-/// The items go in their order, as far as they fit under the limit of open file descriptors of the
-/// next instance, counting the extra ones of each, and one that doesn't fit is left out whole,
-/// while those after it may still fit.
+/// An item that can't be saved, as one whose record fails to be saved, fails the hand-over, naming
+/// the item, and nothing is stored.
 #[test]
-fn items_fit_under_the_fd_limit() {
-    let manager = Manager::new().unwrap();
-    let mut first = store(&manager);
-    let reserved = START as usize + manager.store_max();
-    first.set_fd_limit(Some(reserved as u64 + 4));
+fn unsaved_items_fail_the_hand_over() {
+    for unsaved in [
+        Box::new(Unsaved) as Box<dyn Save>,
+        Box::new(Failing(pipe().1)),
+    ] {
+        let manager = Manager::new().unwrap();
+        let items: [(u64, Box<dyn Save>); 3] = [
+            (1, Box::new(Item::new(b"one", vec![pipe().1]))),
+            (2, unsaved),
+            (3, Box::new(Item::new(b"three", vec![pipe().1]))),
+        ];
+        let handover = store(&manager).handover().unwrap();
+        let error = handover.store(&[][..], items).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("item 2 "), "{error}");
 
-    let mut handover = first.handover().unwrap();
-    handover.set_spare_fds(0);
-    handover.set_extra_fds_per_item(1);
-    // Each takes one file descriptor more than it has: 2, then 3, which don't fit with the 2 left,
-    // then 1, which does.
-    let items = [
-        (1, Item::new(b"one", vec![pipe().1])),
-        (2, Item::new(b"two", vec![pipe().1, pipe().1])),
-        (3, Item::new(b"three", Vec::new())),
-    ];
-    let stored = handover.store(&[][..], items).unwrap();
-    assert_eq!(stored.items(), 2);
-    let [(2, LeftOut::FdLimit)] = stored.left_out() else {
-        panic!("{stored:?}");
-    };
-
-    let restored = take_over(&manager);
-    assert_eq!(ids(restored), [1, 3]);
+        let mut passed = manager.passed().unwrap();
+        assert!(store(&manager).take_over(&mut passed).unwrap().is_none());
+    }
 }
 
-/// An item that can't be saved, and one whose record fails to be saved, are left out alone, with
-/// their file descriptors, and the others go.
+/// A take-over fails if file descriptors of an item aren't all there, and what was stored is
+/// removed from the store all the same.
 #[test]
-fn unsaved_items_are_left_out() {
-    let manager = Manager::new().unwrap();
-    let items: [(u64, Box<dyn Save>); 3] = [
-        (1, Box::new(Unsaved)),
-        (2, Box::new(Failing(pipe().1))),
-        (3, Box::new(Item::new(b"three", vec![pipe().1]))),
-    ];
-    let stored = store(&manager)
-        .handover()
-        .unwrap()
-        .store(&[][..], items)
-        .unwrap();
-    assert_eq!((stored.items(), stored.fds()), (1, 1));
-    let [(1, LeftOut::Unsaved), (2, LeftOut::Save(e))] = stored.left_out() else {
-        panic!("{stored:?}");
-    };
-    assert_eq!(e.kind(), ErrorKind::Other);
-
-    let mut restored = take_over(&manager);
-    let item = restored.take_items().next().unwrap();
-    assert_eq!(
-        (item.id, item.record, item.fds.len()),
-        (3, &b"three"[..], 1)
-    );
-}
-
-/// The items whose file descriptors aren't all there are left out as the next instance takes over,
-/// and the others aren't.
-#[test]
-fn items_with_missing_fds_are_left_out() {
+fn missing_fds_fail_the_take_over() {
     let manager = Manager::new().unwrap();
     let items = [
         (1, Item::new(b"one", vec![pipe().1])),
@@ -212,9 +178,50 @@ fn items_with_missing_fds_are_left_out() {
     stored[1].1 = queue.into_socket();
     manager.replace_store(stored);
 
-    let restored = take_over(&manager);
-    assert_eq!(restored.left_out(), [2]);
-    assert_eq!(ids(restored), [1, 3]);
+    let mut passed = manager.passed().unwrap();
+    let mut store = store(&manager);
+    let error = store.take_over(&mut passed).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains("item 2 "), "{error}");
+    store.notifier().barrier(WAIT).unwrap();
+    assert_eq!(manager.take_removed(), ["test/fds", "test/state"]);
+}
+
+/// A take-over fails with the system's error of too many open files if the file descriptors of the
+/// hand-over don't fit under the soft limit of open files of the process.
+#[test]
+fn take_over_over_the_fd_limit() {
+    let test = "store::tests::take_over_over_the_fd_limit";
+    if !in_own_process(test, "ZOTER_TEST_LOW_NOFILE=1") {
+        return;
+    }
+
+    let manager = Manager::new().unwrap();
+    let (_read, write) = pipe();
+    let fds = iter::repeat_with(|| write.try_clone().unwrap())
+        .take(32)
+        .collect();
+    let items = [(1, Item::new(b"many", fds))];
+    store(&manager)
+        .handover()
+        .unwrap()
+        .store(&[][..], items)
+        .unwrap();
+    let mut passed = manager.passed().unwrap();
+    let mut store = store(&manager);
+    // Room for a few file descriptors more than are open, which the manager adds to as it closes
+    // what it removes from its store, and far fewer than the hand-over has.
+    let open = std::fs::read_dir("/proc/self/fd").unwrap().count() as u64;
+    let mut limit = getrlimit(Resource::Nofile);
+    limit.current = Some(open + 2);
+    setrlimit(Resource::Nofile, limit).unwrap();
+
+    let error = store.take_over(&mut passed).unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(Errno::MFILE.raw_os_error()),
+        "{error}"
+    );
 }
 
 /// A state that can't be saved fails the hand-over, as one that fails to be saved does.
@@ -300,14 +307,12 @@ fn queued_fds_come_back_by_their_index() {
         true => Some(first.take().unwrap_or_default()),
         false => last.take(),
     });
-    let (queued, failure) = queue_fds(chunks, 3, |socket| {
+    queue_fds(chunks, 3, |socket| {
         stored.borrow_mut().push(socket);
 
         Ok(())
     })
     .unwrap();
-    assert!(failure.is_none(), "{failure:?}");
-    assert_eq!(queued, fds.len());
     let mut stored = stored.into_inner();
     assert_eq!(
         stored.len(),
@@ -316,8 +321,7 @@ fn queued_fds_come_back_by_their_index() {
     );
 
     stored.reverse();
-    let (mut taken, complete) = take_queued(stored);
-    assert!(complete);
+    let mut taken = take_queued(stored).unwrap();
     // What goes into each file descriptor comes out of the pipe that it was queued of.
     for (index, pipe) in [(0, 0), (1, 1), (2, 2), (3, 0)] {
         let fd = taken.remove(&index).unwrap();
@@ -330,32 +334,36 @@ fn queued_fds_come_back_by_their_index() {
     assert!(taken.is_empty(), "{taken:?}");
 }
 
-/// The file descriptors go in no more queue sockets than the store has room for: those of the
-/// datagrams that fit in them are queued, and the others aren't.
+/// The file descriptors go in no more queue sockets than the store has room for, and queueing
+/// fails, naming the setting of the unit to raise, if they don't fit in them.
 #[test]
-fn queued_fds_fill_the_room_of_the_store() {
+fn queued_fds_that_overflow_the_store() {
     let fd = pipe().1;
     let fds = [fd.as_fd()];
     let mut stored = Vec::new();
 
     // One datagram with a file descriptor, then ones without, more than any queue socket takes.
     let chunks = iter::once(&fds[..]).chain(iter::repeat(&fds[..0]));
-    let (queued, failure) = queue_fds(chunks, 1, |socket| {
+    let error = queue_fds(chunks, 1, |socket| {
         stored.push(socket);
 
         Ok(())
     })
-    .unwrap();
-    assert!(failure.is_none(), "{failure:?}");
-    assert_eq!(queued, 1);
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::StorageFull);
+    assert!(
+        error.to_string().contains("`FileDescriptorStoreMax=`"),
+        "{error}"
+    );
+    // The queue socket that the store had room for was stored all the same.
     assert_eq!(stored.len(), 1);
-    let (taken, _) = take_queued(stored);
+    let taken = take_queued(stored).unwrap();
     assert_eq!(taken.into_keys().collect::<Vec<_>>(), [0]);
 
-    // A store without room takes none.
-    let (queued, failure) = queue_fds([&fds[..]], 0, |_| unreachable!()).unwrap();
-    assert_eq!(queued, 0);
-    assert!(failure.is_none());
+    // A store without room takes none, but for none at all.
+    let error = queue_fds([&fds[..]], 0, |_| unreachable!()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::StorageFull);
+    queue_fds([], 0, |_| unreachable!()).unwrap();
 }
 
 /// An item gets the file descriptors at its place, if they are all there, and none otherwise,

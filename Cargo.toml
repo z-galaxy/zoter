@@ -32,8 +32,8 @@ targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
 default = ["tracing"]
-# Logs through `tracing` what a restart left out, and which setting of the unit would have kept it;
-# a build without it logs nothing.
+# Logs through `tracing` what goes wrong as a service hands over or takes over, and which setting
+# of the unit to raise for it; a build without it logs nothing.
 tracing = ["dep:tracing"]
 # `zoter::testing`: a fake service manager, for the tests of the restarts of services.
 testing = ["dep:libc"]
