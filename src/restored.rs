@@ -14,7 +14,6 @@ pub struct Restored {
     pub(crate) state: Range<usize>,
     pub(crate) state_fds: Vec<OwnedFd>,
     pub(crate) items: Vec<Slot>,
-    pub(crate) left_out: Vec<u64>,
 }
 
 impl Restored {
@@ -28,8 +27,8 @@ impl Restored {
         mem::take(&mut self.state_fds)
     }
 
-    /// Take the items whose file descriptors are all there, in the order that they were handed
-    /// over: none the second time. Those that the iterator doesn't get to close as it goes.
+    /// Take the items, in the order that they were handed over: none the second time. Those that
+    /// the iterator doesn't get to close as it goes.
     pub fn take_items(&mut self) -> impl Iterator<Item = RestoredItem<'_>> {
         let view = &self.view;
 
@@ -38,16 +37,6 @@ impl Restored {
             record: &view[slot.record],
             fds: slot.fds,
         })
-    }
-
-    /// The ids of the items that were left out, as their file descriptors are not all there, in
-    /// the order that they were handed over.
-    ///
-    /// The kernel closes the file descriptors that the process can't have, as when it has as many
-    /// open as its limit of open files takes, which [`raise_fd_limit`](crate::raise_fd_limit)
-    /// raises. Those of the item that are there close.
-    pub fn left_out(&self) -> &[u64] {
-        &self.left_out
     }
 }
 
@@ -58,7 +47,6 @@ impl fmt::Debug for Restored {
             .field("state_len", &self.state.len())
             .field("state_fds", &self.state_fds.len())
             .field("items", &self.items.len())
-            .field("left_out", &self.left_out)
             .finish()
     }
 }

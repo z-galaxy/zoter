@@ -17,15 +17,14 @@ use std::{
 /// hand-over can be of different types, as `dyn Save`.
 pub trait Save {
     /// The exact length of the record, or `None` for what can't be saved, as the hand-over of a
-    /// connection that only goes on in this process: a hand-over leaves it out.
+    /// connection that only goes on in this process: a hand-over of it fails.
     fn saved_len(&self) -> Option<usize>;
 
     /// Copy the record into `dest`, which is [`saved_len`](Self::saved_len) bytes long, and can be
     /// anywhere in memory, at any address, such as the place of the record in a memfd that is
     /// mapped into memory.
     ///
-    /// `dest` is zeroed. A record that fails to be saved leaves its item out of the hand-over, and
-    /// nothing else.
+    /// `dest` is zeroed. A record that fails to be saved fails the hand-over.
     fn save(&self, dest: &mut [u8]) -> io::Result<()>;
 
     /// The file descriptors that go with the record, in the order that [`Restore::restore`] takes

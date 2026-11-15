@@ -62,8 +62,8 @@ src/
 ├── passed.rs      # Passed: the FDs that systemd passes, as sd_listen_fds(3) takes them
 ├── notifier.rs    # Notifier: $NOTIFY_SOCKET, as sd_notify(3) has it, storing FDs and barriers
 ├── limit.rs       # raise_fd_limit
-├── handover.rs    # Handover: a hand-over that a store started; Stored and LeftOut: what went
-├── store.rs       # Store: handover, take_over and storing, fitting the items, the reserved FDs
+├── handover.rs    # Handover: a hand-over that a store started; Stored: what went
+├── store.rs       # Store: handover, take_over and storing, queueing the FDs, the reserved FDs
 ├── store/tests.rs # Its tests, against testing::Manager in the test process
 ├── restored.rs    # Restored and RestoredItem: what was handed over, read in place
 ├── layout.rs      # The format of the memfd: header, table of the items, records
