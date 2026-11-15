@@ -1,5 +1,5 @@
 #![doc = include_str!("../README.md")]
-#![doc(html_root_url = "https://docs.rs/zoter/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/zoter/0.2.0")]
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/z-galaxy/zoter/ef25fb8c4c17c9d33ada3e9b3edea7830f898774/data/logo.png"
 )]
