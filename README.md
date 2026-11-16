@@ -53,11 +53,11 @@ depends on no async runtime.
 ## The life of a service
 
 ```rust
-use std::{io, os::fd::OwnedFd};
+use std::os::fd::OwnedFd;
 
 use zoter::{Passed, Store};
 
-fn main() -> io::Result<()> {
+fn main() -> zoter::Result<()> {
     // The next instance takes the file descriptors of a hand-over out of the store under this
     // limit, and fails to take it over if they don't fit.
     zoter::raise_fd_limit()?;
@@ -135,6 +135,22 @@ FileDescriptorStoreMax=16
 later. A stop, or a start after a stop, doesn't keep them: systemd closes the store as the service
 stops for good.
 
+## Errors
+
+The fallible functions of zoter return a [`zoter::Result`]. The one exception is restoring an item,
+which fails with the error that its [`Restore`] implementation chooses. An [`Error`] says what went
+wrong:
+
+* [`Error::NoStore`], [`Error::StoreTooSmall`] and [`Error::StoreFull`] name the unit setting to
+  raise, `FileDescriptorStoreMax=`.
+* [`Error::InvalidHandover`] and [`Error::UnsupportedHandover`] mean that the next instance can't
+  take over the hand-over. It then starts afresh without it.
+* [`Error::Io`] is the error that the system returned, such as `EMFILE` when the file descriptors
+  of a hand-over don't fit under the limit of open files.
+
+Each variant converts into an [`std::io::Error`] of a matching kind. So a service whose functions
+return `std::io::Result` can use `?` on these errors too.
+
 ## Status
 
 In development: the API can change from one minor version to the next.
@@ -166,3 +182,12 @@ In development: the API can change from one minor version to the next.
 [`Save`]: https://docs.rs/zoter/latest/zoter/trait.Save.html
 [`Restore`]: https://docs.rs/zoter/latest/zoter/trait.Restore.html
 [`testing::Manager`]: https://docs.rs/zoter/latest/zoter/testing/struct.Manager.html
+[`zoter::Result`]: https://docs.rs/zoter/latest/zoter/type.Result.html
+[`Error`]: https://docs.rs/zoter/latest/zoter/enum.Error.html
+[`Error::NoStore`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.NoStore
+[`Error::StoreTooSmall`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.StoreTooSmall
+[`Error::StoreFull`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.StoreFull
+[`Error::InvalidHandover`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.InvalidHandover
+[`Error::UnsupportedHandover`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.UnsupportedHandover
+[`Error::Io`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.Io
+[`std::io::Error`]: https://doc.rust-lang.org/std/io/struct.Error.html

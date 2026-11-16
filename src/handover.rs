@@ -1,8 +1,6 @@
 //! A hand-over of a service to its next instance: [`Handover`], and what it stored: [`Stored`].
 
-use std::io;
-
-use crate::{Notifier, Save, Store};
+use crate::{Notifier, Result, Save, Store};
 
 /// A hand-over of a service to its next instance, through its [`Store`], which
 /// [`Store::handover`] starts.
@@ -32,17 +30,18 @@ impl Handover {
     /// the item by. The items are of any type, borrowed or owned, those of different types as
     /// `&dyn Save` or `Box<dyn Save>`.
     ///
-    /// The hand-over is stored whole, or this fails: nothing of it is left out. It fails with
-    /// [`ErrorKind::InvalidInput`](io::ErrorKind::InvalidInput) if the state or an item can't be
-    /// saved, or if its record fails to be saved, naming the id of the item, and nothing is stored
-    /// then. It fails with [`ErrorKind::StorageFull`](io::ErrorKind::StorageFull) if the file
-    /// descriptors don't fit in the store, which is to take more with `FileDescriptorStoreMax=` of
-    /// the service, and with any I/O error of storing the memfd or the file descriptors, or of
-    /// queueing them for the store. If systemd takes longer than 5 s to deal with what was stored,
-    /// it fails with [`ErrorKind::TimedOut`](io::ErrorKind::TimedOut). A hand-over that fails once
-    /// the memfd was stored may leave part of it in the store, which the next instance fails to
-    /// take over, and removes from the store as it does any other.
-    pub fn store<S, I, T>(self, state: S, items: I) -> io::Result<Stored>
+    /// Either the whole hand-over is stored, or this fails: no part of it is left out. It fails
+    /// with [`Error::Unsaved`](crate::Error::Unsaved) if the state or an item can't be saved, or if
+    /// saving its record fails. The error names the id of the item, and nothing is stored. It fails
+    /// with [`Error::StoreFull`](crate::Error::StoreFull) if the file descriptors don't fit in the
+    /// store. The service's `FileDescriptorStoreMax=` makes the store hold more. It fails with
+    /// [`Error::Io`](crate::Error::Io) for any I/O error while storing the memfd or the file
+    /// descriptors, or while queueing them for the store. It fails with
+    /// [`Error::TimedOut`](crate::Error::TimedOut) if systemd takes longer than 5 s to process what
+    /// was stored. A hand-over that fails after the memfd was stored may leave part of itself in
+    /// the store. The next instance fails to take that part over, and removes it from the store
+    /// like any other hand-over.
+    pub fn store<S, I, T>(self, state: S, items: I) -> Result<Stored>
     where
         S: Save,
         I: IntoIterator<Item = (u64, T)>,

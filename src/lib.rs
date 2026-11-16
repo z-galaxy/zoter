@@ -10,6 +10,8 @@
 #[macro_use]
 mod log;
 
+mod error;
+pub use error::{Error, Result};
 mod handover;
 pub use handover::{Handover, Stored};
 mod layout;

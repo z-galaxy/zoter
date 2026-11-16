@@ -57,6 +57,7 @@ manager, which CodSpeed's simulation of the CPU leaves out.
 ```
 src/
 ├── lib.rs         # Re-exports the API below; the README is the crate docs
+├── error.rs       # Error and Result, the error type of the API; Error converts to io::Error
 ├── log.rs         # warn!/debug! through `tracing`, or nothing without the feature
 ├── save.rs        # Save and Restore: what an item of a hand-over is, a record and FDs
 ├── passed.rs      # Passed: the FDs that systemd passes, as sd_listen_fds(3) takes them

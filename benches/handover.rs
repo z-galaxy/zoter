@@ -29,7 +29,6 @@ fn main() {}
 #[cfg(target_os = "linux")]
 mod linux {
     use std::{
-        io,
         os::{
             fd::{AsFd, BorrowedFd, OwnedFd},
             unix::net::UnixStream,
@@ -185,7 +184,7 @@ mod linux {
             Some(self.record.len())
         }
 
-        fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+        fn save(&self, dest: &mut [u8]) -> zoter::Result<()> {
             dest.copy_from_slice(&self.record);
 
             Ok(())
@@ -197,11 +196,11 @@ mod linux {
     }
 
     impl Restore for Connection {
-        type Error = io::Error;
+        type Error = zoter::Error;
 
-        fn restore(record: &[u8], fds: Vec<OwnedFd>) -> io::Result<Self> {
+        fn restore(record: &[u8], fds: Vec<OwnedFd>) -> zoter::Result<Self> {
             let [socket] = <[OwnedFd; 1]>::try_from(fds).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "a connection has one socket")
+                zoter::Error::InvalidHandover("a connection has one socket".to_owned())
             })?;
 
             Ok(Self {

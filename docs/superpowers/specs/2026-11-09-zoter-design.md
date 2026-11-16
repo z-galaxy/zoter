@@ -70,7 +70,7 @@ stores under, the layout of the memfd, busd's state and zbus's API can all chang
 ## The life of a service
 
 ```rust
-fn main() -> io::Result<()> {
+fn main() -> zoter::Result<()> {
     // The next instance takes the FDs of the hand-over out of the queue sockets under this limit.
     zoter::raise_fd_limit()?;
     // SAFETY: No other thread runs yet, so none reads or writes the environment meanwhile, and
@@ -80,7 +80,7 @@ fn main() -> io::Result<()> {
     runtime.block_on(serve(passed))
 }
 
-async fn serve(mut passed: zoter::Passed) -> io::Result<()> {
+async fn serve(mut passed: zoter::Passed) -> zoter::Result<()> {
     // `None` without `$NOTIFY_SOCKET`, as when systemd didn't start the service.
     let mut store = zoter::Store::from_env("example")?;
     // Takes the FDs stored under `example/` out of `passed`, removes them from the store, and
@@ -98,7 +98,7 @@ async fn serve(mut passed: zoter::Passed) -> io::Result<()> {
             let connections = restored
                 .take_items()
                 .map(|item| Ok((item.id, item.restore::<Connection>()?)))
-                .collect::<io::Result<Vec<_>>>()?;
+                .collect::<zoter::Result<Vec<_>>>()?;
 
             Server::restore(state, connections, listener)
         }
@@ -154,7 +154,7 @@ pub trait Save {
     fn saved_len(&self) -> Option<usize>;
     /// Copy the record into `dest`, which is `saved_len` bytes long, at any address, such as its
     /// place in a memfd mapped into memory.
-    fn save(&self, dest: &mut [u8]) -> io::Result<()>;
+    fn save(&self, dest: &mut [u8]) -> zoter::Result<()>;
     /// The FDs, in the order that `Restore::restore` takes them.
     fn fds(&self) -> Vec<BorrowedFd<'_>>;
 }
@@ -167,13 +167,14 @@ pub trait Restore: Sized {
 }
 ```
 
-The names are those of zbus's methods today, which the traits take the place of. `Save` takes no
-generics and returns no `impl Trait`, so that a hand-over can hold items of different types, as
-`dyn Save`. It is implemented for `[u8]` and `Vec<u8>` (a record with no FDs), for `OwnedFd` and
-`BorrowedFd` (one FD with an empty record), and for `&T` and `Box<T>`; `Restore` for `Vec<u8>`
-and `OwnedFd`, and for `(Vec<u8>, Vec<OwnedFd>)`, a record and its FDs as they are. Records are
-copied once, from the item into the memfd, and read back in place: zbus's records are a multiple of
-8 bytes long, and each record starts at a multiple of 8.
+The names are those of the zbus methods that the traits replace. `Save` takes no generics and
+returns no `impl Trait`, so that a hand-over can hold items of different types as `dyn Save`.
+`Save` is implemented for `[u8]` and `Vec<u8>` (a record with no FDs), for `OwnedFd` and
+`BorrowedFd` (one FD with an empty record), and for `&T` and `Box<T>`. `Restore` is implemented
+for `Vec<u8>` and `OwnedFd`, with `zoter::Error` as their `Error`. It is also implemented for
+`(Vec<u8>, Vec<OwnedFd>)`, which gives a record and its FDs unchanged and can't fail. Records are
+copied once, from the item into the memfd, and read back in place. zbus's records are a multiple
+of 8 bytes long, and each record starts at a multiple of 8.
 
 ### `Passed`: what systemd passed to this process
 
@@ -194,7 +195,7 @@ impl Passed {
     /// `std::env::remove_var`: call it before the process starts any other thread. Nothing else
     /// in the process may own the FDs that the environment tells of, as an `sd_listen_fds(0)`
     /// that took them before does: those go to `Passed::new`.
-    pub unsafe fn from_env() -> io::Result<Self>;
+    pub unsafe fn from_env() -> zoter::Result<Self>;
     /// FDs passed some other way, with their names.
     pub fn new(fds: Vec<(String, OwnedFd)>) -> Self;
     /// Take the first FD named `name`.
@@ -217,11 +218,12 @@ owns them already, as something does that took them before.
 
 ### `Notifier`: the notification socket
 
-busd's `Notifier`, as it is: `from_env() -> io::Result<Option<Self>>`, `new(address)`,
-`notify(&str)`, `notify_with_fds(&str, &[BorrowedFd])`, `store(name, &[BorrowedFd])` (always with
-`FDPOLL=0`, so that systemd doesn't close a stored socket whose peer hung up before the next
-instance read what it sent), `remove(name)` and `barrier(Duration)`, plus `try_clone()`. States
-stay strings (`"READY=1"`, `"STOPPING=1"`, `"EXTEND_TIMEOUT_USEC=…"`); typed ones can come later.
+This is busd's `Notifier` with `zoter::Result` in place of `io::Result`:
+`from_env() -> zoter::Result<Option<Self>>`, `new(address)`, `notify(&str)`,
+`notify_with_fds(&str, &[BorrowedFd])`, `store(name, &[BorrowedFd])`, `remove(name)` and
+`barrier(Duration)`. It adds `try_clone()`. `store` always sends `FDPOLL=0`, so that systemd doesn't
+close a stored socket whose peer hung up before the next instance read what the peer sent. States
+stay strings (`"READY=1"`, `"STOPPING=1"`, `"EXTEND_TIMEOUT_USEC=…"`); typed states can come later.
 
 ### `Store`: the store of the service, under a key
 
@@ -236,21 +238,22 @@ pub struct Store { /* notifier, key, $FDSTORE, the reserved FDs */ }
 
 impl Store {
     /// The store of the service that `$NOTIFY_SOCKET` names, taking `$FDSTORE` FDs, if set.
-    pub fn from_env(key: &str) -> io::Result<Option<Self>>;
+    pub fn from_env(key: &str) -> zoter::Result<Option<Self>>;
     /// The store of the service that `notifier` reaches, taking `max` FDs.
-    pub fn new(notifier: Notifier, key: &str, max: Option<usize>) -> io::Result<Self>;
+    pub fn new(notifier: Notifier, key: &str, max: Option<usize>) -> zoter::Result<Self>;
     pub fn notifier(&self) -> &Notifier;
     /// How many FDs the store takes, as `FileDescriptorStoreMax=` of the unit sets it.
     pub fn max(&self) -> Option<usize>;
     /// Take over from the previous instance: take the FDs stored under the key out of `passed`,
-    /// remove them from the store, and read the hand-over that they hold, if any, whole: it fails
-    /// with `EMFILE` if the FDs don't fit under the soft limit of open FDs of the process, and with
-    /// `ErrorKind::InvalidData` if FDs of the state or of an item are missing otherwise.
-    pub fn take_over(&mut self, passed: &mut Passed) -> io::Result<Option<Restored>>;
-    /// Start a hand-over to the next instance: it fails with `ErrorKind::Unsupported` if the
-    /// store can't take one (the state memfd and a queue socket), saying why, and which setting
-    /// of the unit to change. It logs nothing.
-    pub fn handover(self) -> io::Result<Handover>;
+    /// remove them from the store, and read the whole hand-over that they hold, if any. It fails
+    /// with `Error::Io` of `EMFILE` if the FDs don't fit under the process's soft limit of open
+    /// FDs. It fails with `Error::InvalidHandover` if FDs of the state or of an item are missing
+    /// for another reason.
+    pub fn take_over(&mut self, passed: &mut Passed) -> zoter::Result<Option<Restored>>;
+    /// Start a hand-over to the next instance. It fails with `Error::NoStore` or
+    /// `Error::StoreTooSmall` if the store can't hold one (the state memfd and a queue socket).
+    /// The error says why, and which unit setting to change. It logs nothing.
+    pub fn handover(self) -> zoter::Result<Handover>;
 }
 ```
 
@@ -268,7 +271,7 @@ impl Handover {
     pub fn notifier(&self) -> &Notifier;
     /// Store `state`, and `items`, each under an id that the crate doesn't look at, so that the
     /// state can refer to it, for the next instance, and wait for systemd to have dealt with it.
-    pub fn store<S, I, T>(self, state: S, items: I) -> io::Result<Stored>
+    pub fn store<S, I, T>(self, state: S, items: I) -> zoter::Result<Stored>
     where
         S: Save,
         I: IntoIterator<Item = (u64, T)>,
@@ -281,12 +284,13 @@ hand over, and gives the state and the items to `store` once it stopped: a hand-
 from its start would hold borrows of what the service makes later, which its drop would outlive.
 Items of different types go as `&dyn Save` or `Box<dyn Save>`.
 
-`store` stores the state and every item, or fails: with `ErrorKind::InvalidInput` if the state
-or an item can't be saved, or its `save` fails, naming the id of the item, before anything is
-stored; with `ErrorKind::StorageFull` if the FDs don't fit in the store, naming
-`FileDescriptorStoreMax=`; and with the error of queueing the FDs or of storing them. It predicts
-nothing of the next instance, whose limit of open FDs the caller would otherwise have to describe,
-FDs that it opens later included. What was stored is in the `Stored` that it returns:
+`store` either stores the state and every item, or fails. It fails with `Error::Unsaved` if the
+state or an item can't be saved, or if its `save` fails. The error names the id of the item, and
+it happens before anything is stored. It fails with `Error::StoreFull` if the FDs don't fit in the
+store, and the message names `FileDescriptorStoreMax=`. It fails with the error of queueing or
+storing the FDs. It makes no prediction about the next instance: otherwise the caller would have
+to describe that instance's limit of open FDs, including FDs that it opens later. The `Stored`
+that it returns tells what was stored:
 
 ```rust
 #[derive(Debug)]
@@ -326,12 +330,54 @@ impl RestoredItem<'_> {
 ```rust
 /// Raise the soft limit of open FDs of the process to the hard one, and give the new soft limit,
 /// `None` for none.
-pub fn raise_fd_limit() -> io::Result<Option<u64>>;
+pub fn raise_fd_limit() -> zoter::Result<Option<u64>>;
 ```
 
 The next instance takes the FDs of a hand-over out of the queue sockets under its soft limit, the
 kernel closes those that don't fit, and `take_over` then fails with `EMFILE`, so it raises the
 limit first. The hard limit, `LimitNOFILE=` of the service, bounds how many it can take.
+
+### `Error`: what went wrong
+
+```rust
+/// The error type of the crate's API.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// An I/O error, including `EMFILE` when the FDs of a hand-over don't fit under the limit of
+    /// open files.
+    Io(io::Error),
+    /// `$LISTEN_PID`, `$LISTEN_FDS`, `$LISTEN_FDNAMES` or `$NOTIFY_SOCKET` has an invalid value.
+    Environment(String),
+    /// A store key or an FD name that zoter does not accept.
+    InvalidName(String),
+    /// systemd keeps no store for the service.
+    NoStore,
+    /// The store takes fewer FDs than any hand-over needs.
+    StoreTooSmall { max: usize },
+    /// The store has no room for the FDs of this hand-over.
+    StoreFull,
+    /// The state (`item` is `None`) or an item can't be saved, or its `Save::save` failed
+    /// (`source` holds the error).
+    Unsaved { item: Option<u64>, source: Option<Box<Error>> },
+    /// A hand-over that this version cannot make sense of.
+    InvalidHandover(String),
+    /// A hand-over that a later version laid out.
+    UnsupportedHandover(String),
+    /// The service manager did not process the messages sent to it in time.
+    TimedOut,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+```
+
+The variants are the cases that a caller tells apart. Some name a unit setting to change
+(`NoStore`, `StoreTooSmall`, `StoreFull`). Some mean that the next instance starts afresh without
+the hand-over (`InvalidHandover`, `UnsupportedHandover`). `Io` is the error that the system
+returned. If there is a setting to change, the message names it. Each variant converts into an
+`io::Error` of a matching kind (`InvalidData`, `InvalidInput`, `Unsupported`, `StorageFull` or
+`TimedOut`), and `Io` converts into the wrapped error itself. So a service whose functions return
+`io::Result` can use `?` on an `Error` too.
 
 ## What the store holds
 
@@ -375,26 +421,27 @@ the next instance as two. The memfd is stored first, then the queue sockets.
 Taking over:
 
 - No `<key>/state`: nothing was handed over (`Ok(None)`), and queue sockets without it are closed.
-- A memfd that isn't a hand-over, or of a later major version: an error, and every FD of the
-  hand-over is closed, which disconnects the peers. They are out of the store already.
-- FDs that the kernel closed, as those over the limit of open FDs of the process: `EMFILE`, with
-  a warning that names `LimitNOFILE=`, and every FD of the hand-over is closed.
-- FDs of the state or of an item that are missing otherwise: `ErrorKind::InvalidData`, and every
-  FD of the hand-over is closed.
+- A memfd that isn't a hand-over: `Error::InvalidHandover`. A memfd of a later major version:
+  `Error::UnsupportedHandover`. In both cases every FD of the hand-over is closed, which
+  disconnects the peers. The FDs are already out of the store.
+- FDs that the kernel closed, such as those over the process's limit of open FDs: `Error::Io` of
+  `EMFILE`, with a warning that names `LimitNOFILE=`. Every FD of the hand-over is closed.
+- FDs of the state or of an item that are missing for another reason: `Error::InvalidHandover`.
+  Every FD of the hand-over is closed.
 - FDs that no item has: closed.
 
 Handing over:
 
-- The store can't take a hand-over (no `$FDSTORE`, or fewer than 2): `Store::handover` fails with
-  `ErrorKind::Unsupported`, before the service paused, which shuts down instead.
-- A state or an item that can't be saved, or whose `save` fails: `ErrorKind::InvalidInput`, and
-  nothing is stored.
+- The store can't hold a hand-over (no `$FDSTORE`, or fewer than 2): `Store::handover` fails with
+  `Error::NoStore` or `Error::StoreTooSmall` before the service pauses. The service can then shut
+  down normally instead.
+- A state or an item that can't be saved, or whose `save` fails: `Error::Unsaved`. Nothing is
+  stored.
 - Creating, filling or storing the memfd fails: an error, and all of the hand-over is dropped.
-- FDs that don't fit in the store (`FileDescriptorStoreMax=` too low): `ErrorKind::StorageFull`,
-  with a message that names the setting. FDs that fail to be queued or stored: that error. What
-  was stored by then stays in the store, where the next instance fails to take it over, and
-  removes it.
-- systemd takes longer than 5 s to deal with the messages: `ErrorKind::TimedOut`.
+- FDs that don't fit in the store (`FileDescriptorStoreMax=` too low): `Error::StoreFull`, with a
+  message that names the setting. Queueing or storing the FDs fails: that error. What was stored
+  up to then stays in the store. The next instance fails to take it over, and removes it.
+- systemd takes longer than 5 s to process the messages: `Error::TimedOut`.
 
 The warnings go through `tracing`, behind a default feature of the same name, as zbus and zruntime
 have it; the counts are in `Stored`, and the errors say what failed, for the caller to log its own

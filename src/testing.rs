@@ -31,7 +31,7 @@ use rustix::{
 };
 
 use crate::{
-    Notifier, Passed,
+    Error, Notifier, Passed, Result,
     notifier::MAX_FDS,
     passed::START,
     queue::{self, Queue},
@@ -66,7 +66,7 @@ pub struct Manager {
 impl Manager {
     /// A manager whose store takes 16 file descriptors, and that has no socket of socket
     /// activation yet.
-    pub fn new() -> io::Result<Self> {
+    pub fn new() -> Result<Self> {
         let path = env::temp_dir().join(unique_name());
         let socket = UnixDatagram::bind(&path)?;
         let shared = Arc::new(Shared {
@@ -87,7 +87,7 @@ impl Manager {
             Err(e) => {
                 let _ = remove_file(&path);
 
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -106,7 +106,7 @@ impl Manager {
 
     /// A notifier of this manager, as [`Notifier::from_env`] gives one to the services that it
     /// starts.
-    pub fn notifier(&self) -> io::Result<Notifier> {
+    pub fn notifier(&self) -> Result<Notifier> {
         Notifier::new(&self.path)
     }
 
@@ -137,7 +137,7 @@ impl Manager {
     /// What systemd would pass a service that it starts now: duplicates of the sockets of socket
     /// activation, then of what is in the store, with their names, as [`Passed::from_env`] gives
     /// them.
-    pub fn passed(&self) -> io::Result<Passed> {
+    pub fn passed(&self) -> Result<Passed> {
         let state = self.shared.state();
         let fds = self
             .activation
@@ -157,7 +157,7 @@ impl Manager {
     /// and `$FDSTORE` telling how many file descriptors the store takes. A shell runs `program` as
     /// itself, so that `$LISTEN_PID` is the PID of `program`, which can't be known before it
     /// starts. The command keeps duplicates of the file descriptors to pass until it is dropped.
-    pub fn command(&self, program: impl AsRef<OsStr>) -> io::Result<Command> {
+    pub fn command(&self, program: impl AsRef<OsStr>) -> Result<Command> {
         let passed = self.passed()?.into_vec();
         let count = passed.len();
         // The file descriptors may be among those they are to be passed as, so that passing one
@@ -171,7 +171,7 @@ impl Manager {
         let mut copies = Vec::with_capacity(count);
         for (name, fd) in passed {
             names.push(name);
-            copies.push(fcntl_dupfd_cloexec(&fd, first_free)?);
+            copies.push(fcntl_dupfd_cloexec(&fd, first_free).map_err(Error::os)?);
         }
         let sources: Vec<RawFd> = copies.iter().map(AsRawFd::as_raw_fd).collect();
 
@@ -225,9 +225,11 @@ impl Manager {
     /// Wait, `timeout` at most, for a notification that has `state` as one of its lines, such as
     /// `READY=1`, and let go of those that came before it.
     ///
-    /// Each notification is waited for once: a second wait for `READY=1` waits for another one. It
-    /// fails with [`ErrorKind::TimedOut`] if none comes in time.
-    pub fn wait_for(&self, state: &str, timeout: Duration) -> io::Result<()> {
+    /// Each notification satisfies only one wait: a second wait for `READY=1` waits for another
+    /// one. It fails with [`Error::Io`] of [`ErrorKind::TimedOut`] if none comes in time. It does
+    /// not use [`Error::TimedOut`], because that error means that the manager is late, and here the
+    /// service is late.
+    pub fn wait_for(&self, state: &str, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.shared.state();
         loop {
@@ -241,7 +243,8 @@ impl Manager {
                 return Err(io::Error::new(
                     ErrorKind::TimedOut,
                     format!("no `{state}` came in time"),
-                ));
+                )
+                .into());
             }
             guard = self
                 .shared
@@ -270,7 +273,7 @@ impl Manager {
     }
 
     /// Duplicates of what is in the store, with their names, in the order that it was stored.
-    pub fn stored(&self) -> io::Result<Vec<(String, OwnedFd)>> {
+    pub fn stored(&self) -> Result<Vec<(String, OwnedFd)>> {
         let state = self.shared.state();
 
         state
@@ -287,7 +290,7 @@ impl Manager {
     /// The queue sockets give their file descriptors up as they are read, so this takes them out
     /// and puts them back in queue sockets of its own, which take their places in the store. It
     /// fails as reading a queue does, as with a socket that no hand-over stored.
-    pub fn stored_fds(&self, key: &str) -> io::Result<usize> {
+    pub fn stored_fds(&self, key: &str) -> Result<usize> {
         let name = format!("{key}/fds");
         let mut state = self.shared.state();
         let mut count = 0;
@@ -298,7 +301,7 @@ impl Manager {
             for (index, fds) in &taken {
                 let fds: Vec<_> = fds.iter().map(AsFd::as_fd).collect();
                 if !refilled.push(*index, &fds)? {
-                    return Err(io::Error::other("a queue of the manager is full"));
+                    return Err(io::Error::other("a queue of the manager is full").into());
                 }
                 count += fds.len();
             }
@@ -498,7 +501,10 @@ mod tests {
     use rustix::io::write;
 
     use super::*;
-    use crate::test_utils::{pipe, read_byte};
+    use crate::{
+        Error,
+        test_utils::{pipe, read_byte},
+    };
 
     #[test]
     fn store_and_remove() {
@@ -551,7 +557,10 @@ mod tests {
         let error = manager
             .wait_for("READY=1", Duration::from_millis(100))
             .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(
+            matches!(&error, Error::Io(e) if e.kind() == ErrorKind::TimedOut),
+            "{error:?}"
+        );
 
         notifier.notify("STATUS=Down").unwrap();
         notifier.barrier(WAIT).unwrap();
@@ -600,7 +609,7 @@ mod tests {
             Some(0)
         }
 
-        fn save(&self, _dest: &mut [u8]) -> io::Result<()> {
+        fn save(&self, _dest: &mut [u8]) -> Result<()> {
             Ok(())
         }
 

@@ -1,8 +1,8 @@
 //! The limit of open file descriptors of the process: [`raise_fd_limit`].
 
-use std::io;
-
 use rustix::process::{Resource, getrlimit, setrlimit};
+
+use crate::{Error, Result};
 
 /// Raise the soft limit of the file descriptors that the process may have open to the hard limit,
 /// and give the soft limit that it has then, `None` for none.
@@ -16,7 +16,7 @@ use rustix::process::{Resource, getrlimit, setrlimit};
 /// one, 524288 under systemd, holds plenty. A process that waits on its file descriptors with
 /// `select(2)` can't wait on those from 1024 on, so the limit is for those that wait with epoll or
 /// `poll(2)`, as the async runtimes of Rust do.
-pub fn raise_fd_limit() -> io::Result<Option<u64>> {
+pub fn raise_fd_limit() -> Result<Option<u64>> {
     let mut limit = getrlimit(Resource::Nofile);
     // `None` is no limit.
     let Some(current) = limit.current else {
@@ -26,7 +26,7 @@ pub fn raise_fd_limit() -> io::Result<Option<u64>> {
         return Ok(Some(current));
     }
     limit.current = limit.maximum;
-    setrlimit(Resource::Nofile, limit)?;
+    setrlimit(Resource::Nofile, limit).map_err(Error::os)?;
 
     Ok(limit.current)
 }

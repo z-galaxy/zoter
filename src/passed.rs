@@ -2,13 +2,14 @@
 
 use std::{
     env::{self, VarError},
-    io::{self, ErrorKind},
     os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     process,
     str::FromStr,
 };
 
 use rustix::io::{FdFlags, fcntl_setfd};
+
+use crate::{Error, Result};
 
 /// The file descriptors that the service manager passed to this process, with their names.
 ///
@@ -30,10 +31,11 @@ pub struct Passed {
 impl Passed {
     /// Take the file descriptors that systemd passed to this process, as `sd_listen_fds(3)` does.
     ///
-    /// It takes none if systemd passed none to this process: if the environment doesn't tell of
-    /// any, or tells of those of another process. It fails if what the environment tells of them
-    /// makes no sense, and closes those that it took by then. The file descriptors it takes are
-    /// close-on-exec.
+    /// It takes none if systemd passed none to this process: either the environment lists none, or
+    /// it lists those of another process. It fails with [`Error::Environment`] if the environment
+    /// describes them in a way that makes no sense. It fails with [`Error::Io`] if the environment
+    /// lists a file descriptor that isn't open. When it fails, it closes the file descriptors that
+    /// it took up to then. The file descriptors that it takes are close-on-exec.
     ///
     /// Whether it succeeds or not, it removes `$LISTEN_PID`, `$LISTEN_FDS` and `$LISTEN_FDNAMES`
     /// from the environment, as `sd_listen_fds(3)` does when asked to, and `$LISTEN_PIDFDID` as
@@ -51,7 +53,7 @@ impl Passed {
     /// they're dropped. So nothing may have taken them before, such as an implementation of
     /// `sd_listen_fds(3)` that left the environment as it was, as `sd_listen_fds(0)` does. File
     /// descriptors that the process took some other way go to [`Passed::new`] instead.
-    pub unsafe fn from_env() -> io::Result<Self> {
+    pub unsafe fn from_env() -> Result<Self> {
         // Read all the variables before any of them can end this early, as all of them go either
         // way.
         let pid = var("LISTEN_PID");
@@ -129,14 +131,13 @@ impl Passed {
 }
 
 /// The value of the environment variable `name`, if it is set.
-fn var(name: &str) -> io::Result<Option<String>> {
+fn var(name: &str) -> Result<Option<String>> {
     match env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(VarError::NotPresent) => Ok(None),
-        Err(VarError::NotUnicode(_)) => Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("${name} isn't valid Unicode"),
-        )),
+        Err(VarError::NotUnicode(_)) => {
+            Err(Error::Environment(format!("${name} isn't valid Unicode")))
+        }
     }
 }
 
@@ -146,7 +147,7 @@ fn var(name: &str) -> io::Result<Option<String>> {
 ///
 /// As `sd_listen_fds(3)` does, it takes `$LISTEN_FDS` for garbage if it isn't a number from 1 to
 /// [`MAX_LISTEN_FDS`], but only looks at it if the PID is right.
-fn parse_count(pid: Option<&str>, fds: Option<&str>, own_pid: u32) -> io::Result<Option<usize>> {
+fn parse_count(pid: Option<&str>, fds: Option<&str>, own_pid: u32) -> Result<Option<usize>> {
     let Some(pid) = pid else {
         return Ok(None);
     };
@@ -158,10 +159,9 @@ fn parse_count(pid: Option<&str>, fds: Option<&str>, own_pid: u32) -> io::Result
     };
     match parse_number("$LISTEN_FDS", fds)? {
         count @ 1..=MAX_LISTEN_FDS => Ok(Some(count)),
-        count => Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("$LISTEN_FDS is {count}, not a number from 1 to {MAX_LISTEN_FDS}"),
-        )),
+        count => Err(Error::Environment(format!(
+            "$LISTEN_FDS is {count}, not a number from 1 to {MAX_LISTEN_FDS}"
+        ))),
     }
 }
 
@@ -169,14 +169,14 @@ fn parse_count(pid: Option<&str>, fds: Option<&str>, own_pid: u32) -> io::Result
 ///
 /// Each is found to be open before it's taken: `$LISTEN_FDS` may tell of more than there are, and
 /// an `OwnedFd` of one that isn't open aborts the process when it drops, in a debug build.
-fn take_fds(count: usize) -> io::Result<Vec<OwnedFd>> {
+fn take_fds(count: usize) -> Result<Vec<OwnedFd>> {
     (START..)
         .take(count)
-        .map(|fd| -> io::Result<OwnedFd> {
+        .map(|fd| -> Result<OwnedFd> {
             // SAFETY: It's only borrowed for the call below, which fails with `EBADF` if it isn't
             // open, and does nothing else to it.
             let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-            fcntl_setfd(borrowed, FdFlags::CLOEXEC)?;
+            fcntl_setfd(borrowed, FdFlags::CLOEXEC).map_err(Error::os)?;
             // SAFETY: It's open, as the call above shows, and systemd passed it to this process, as
             // `$LISTEN_PID` says. Nothing else owns it, as the caller of `Passed::from_env` sees
             // to, and nothing takes it after this does, as the variables that tell of it are gone.
@@ -188,36 +188,30 @@ fn take_fds(count: usize) -> io::Result<Vec<OwnedFd>> {
 /// The names of `count` file descriptors, going by `$LISTEN_FDNAMES`.
 ///
 /// There is one for each, or none at all, in which case they are all `unknown`.
-fn parse_names(names: Option<&str>, count: usize) -> io::Result<Vec<String>> {
+fn parse_names(names: Option<&str>, count: usize) -> Result<Vec<String>> {
     let Some(names) = names else {
         return Ok(vec![UNKNOWN.to_owned(); count]);
     };
     let names: Vec<_> = names.split(':').map(str::to_owned).collect();
     if names.len() != count {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "$LISTEN_FDNAMES has {} names for {count} file descriptors",
-                names.len()
-            ),
-        ));
+        return Err(Error::Environment(format!(
+            "$LISTEN_FDNAMES has {} names for {count} file descriptors",
+            names.len()
+        )));
     }
 
     Ok(names)
 }
 
 /// The number that `value` is, for the environment variable `name`.
-fn parse_number<T>(name: &str, value: &str) -> io::Result<T>
+fn parse_number<T>(name: &str, value: &str) -> Result<T>
 where
     T: FromStr,
     T::Err: std::error::Error,
 {
-    value.parse().map_err(|e| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            format!("{name} is {value:?}, not a number: {e}"),
-        )
-    })
+    value
+        .parse()
+        .map_err(|e| Error::Environment(format!("{name} is {value:?}, not a number: {e}")))
 }
 
 /// The largest count that `$LISTEN_FDS` can have: `sd_listen_fds(3)` takes a larger one for garbage
@@ -265,7 +259,10 @@ mod tests {
     fn count_garbage() {
         for pid in ["", "x", "-1", " 42", "42 ", "4.2", "4294967296"] {
             let error = parse_count(Some(pid), Some("3"), 42).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidData, "$LISTEN_PID={pid:?}");
+            assert!(
+                matches!(error, Error::Environment(_)),
+                "$LISTEN_PID={pid:?}: {error:?}"
+            );
         }
 
         let too_many = (MAX_LISTEN_FDS + 1).to_string();
@@ -280,7 +277,10 @@ mod tests {
             &too_many,
         ] {
             let error = parse_count(Some("42"), Some(fds), 42).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidData, "$LISTEN_FDS={fds:?}");
+            assert!(
+                matches!(error, Error::Environment(_)),
+                "$LISTEN_FDS={fds:?}: {error:?}"
+            );
         }
     }
 
@@ -309,10 +309,9 @@ mod tests {
     fn names_that_do_not_match_the_count() {
         for (names, count) in [("a:b", 3), ("a:b:c", 2), ("a", 2), ("", 2), ("a:b", 1)] {
             let error = parse_names(Some(names), count).unwrap_err();
-            assert_eq!(
-                error.kind(),
-                ErrorKind::InvalidData,
-                "{names:?} for {count}"
+            assert!(
+                matches!(error, Error::Environment(_)),
+                "{names:?} for {count}: {error:?}"
             );
         }
     }
@@ -417,7 +416,7 @@ mod tests {
         // SAFETY: The test runs in a process of its own, which has no other thread that reads or
         // writes the environment, nor anything that owns the file descriptors that it tells of.
         let error = unsafe { Passed::from_env() }.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(matches!(error, Error::Environment(_)), "{error:?}");
         assert!(!is_open(3) && !is_open(4));
         assert_listen_variables_removed();
     }
@@ -434,6 +433,9 @@ mod tests {
         // SAFETY: The test runs in a process of its own, which has no other thread that reads or
         // writes the environment, nor anything that owns the file descriptors that it tells of.
         let error = unsafe { Passed::from_env() }.unwrap_err();
+        let Error::Io(error) = error else {
+            panic!("{error:?}");
+        };
         assert_eq!(
             error.raw_os_error(),
             Some(rustix::io::Errno::BADF.raw_os_error())

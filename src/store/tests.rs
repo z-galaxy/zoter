@@ -117,7 +117,7 @@ fn no_take_over_of_garbage() {
     let mut passed = manager.passed().unwrap();
     let mut store = store(&manager);
     let error = store.take_over(&mut passed).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
     store.notifier().barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/other", "test/state"]);
     let names: Vec<_> = passed.iter().map(|(name, _)| name).collect();
@@ -128,9 +128,9 @@ fn no_take_over_of_garbage() {
 /// the item, and nothing is stored.
 #[test]
 fn unsaved_items_fail_the_hand_over() {
-    for unsaved in [
-        Box::new(Unsaved) as Box<dyn Save>,
-        Box::new(Failing(pipe().1)),
+    for (unsaved, failed) in [
+        (Box::new(Unsaved) as Box<dyn Save>, false),
+        (Box::new(Failing(pipe().1)), true),
     ] {
         let manager = Manager::new().unwrap();
         let items: [(u64, Box<dyn Save>); 3] = [
@@ -140,7 +140,14 @@ fn unsaved_items_fail_the_hand_over() {
         ];
         let handover = store(&manager).handover().unwrap();
         let error = handover.store(&[][..], items).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        let Error::Unsaved {
+            item: Some(2),
+            source,
+        } = &error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(source.is_some(), failed, "{error:?}");
         assert!(error.to_string().contains("item 2 "), "{error}");
 
         let mut passed = manager.passed().unwrap();
@@ -181,7 +188,7 @@ fn missing_fds_fail_the_take_over() {
     let mut passed = manager.passed().unwrap();
     let mut store = store(&manager);
     let error = store.take_over(&mut passed).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
     assert!(error.to_string().contains("item 2 "), "{error}");
     store.notifier().barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/fds", "test/state"]);
@@ -217,24 +224,26 @@ fn take_over_over_the_fd_limit() {
     setrlimit(Resource::Nofile, limit).unwrap();
 
     let error = store.take_over(&mut passed).unwrap_err();
-    assert_eq!(
-        error.raw_os_error(),
-        Some(Errno::MFILE.raw_os_error()),
-        "{error}"
+    assert!(
+        matches!(&error, Error::Io(e) if e.raw_os_error() == Some(Errno::MFILE.raw_os_error())),
+        "{error:?}"
     );
 }
 
 /// A state that can't be saved fails the hand-over, as one that fails to be saved does.
 #[test]
 fn unsaved_state() {
-    for state in [
-        Box::new(Unsaved) as Box<dyn Save>,
-        Box::new(Failing(pipe().1)),
+    for (state, failed) in [
+        (Box::new(Unsaved) as Box<dyn Save>, false),
+        (Box::new(Failing(pipe().1)), true),
     ] {
         let manager = Manager::new().unwrap();
         let handover = store(&manager).handover().unwrap();
         let error = handover.store(state, NO_ITEMS).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        let Error::Unsaved { item: None, source } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(source.is_some(), failed, "{error:?}");
     }
 }
 
@@ -246,7 +255,15 @@ fn no_hand_over_without_room() {
     for max in [None, Some(0), Some(1)] {
         let store = Store::new(manager.notifier().unwrap(), KEY, max).unwrap();
         let error = store.handover().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported, "{max:?}");
+        match (max, &error) {
+            (None, Error::NoStore) => (),
+            (Some(max), Error::StoreTooSmall { max: too_few }) => assert_eq!(*too_few, max),
+            _ => panic!("{max:?}: {error:?}"),
+        }
+        assert!(
+            error.to_string().contains("`FileDescriptorStoreMax=`"),
+            "{error}"
+        );
     }
 }
 
@@ -284,7 +301,7 @@ fn keys() {
     let too_long = "a".repeat(MAX_KEY_LEN + 1);
     for key in ["", "a/b", "a:b", "a\nb", "é", &too_long] {
         let error = Store::new(manager.notifier().unwrap(), key, Some(2)).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{key:?}");
+        assert!(matches!(error, Error::InvalidName(_)), "{key:?}: {error:?}");
     }
 }
 
@@ -350,7 +367,7 @@ fn queued_fds_that_overflow_the_store() {
         Ok(())
     })
     .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::StorageFull);
+    assert!(matches!(error, Error::StoreFull), "{error:?}");
     assert!(
         error.to_string().contains("`FileDescriptorStoreMax=`"),
         "{error}"
@@ -362,7 +379,7 @@ fn queued_fds_that_overflow_the_store() {
 
     // A store without room takes none, but for none at all.
     let error = queue_fds([&fds[..]], 0, |_| unreachable!()).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::StorageFull);
+    assert!(matches!(error, Error::StoreFull), "{error:?}");
     queue_fds([], 0, |_| unreachable!()).unwrap();
 }
 
@@ -447,7 +464,7 @@ impl Save for Item {
         Some(self.bytes.len())
     }
 
-    fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, dest: &mut [u8]) -> Result<()> {
         dest.copy_from_slice(&self.bytes);
 
         Ok(())
@@ -466,7 +483,7 @@ impl Save for Unsaved {
         None
     }
 
-    fn save(&self, _dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, _dest: &mut [u8]) -> Result<()> {
         unreachable!("an item that can't be saved was saved")
     }
 
@@ -483,10 +500,10 @@ impl Save for Failing {
         Some(8)
     }
 
-    fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, dest: &mut [u8]) -> Result<()> {
         dest[0] = 1;
 
-        Err(io::Error::other("the record failed"))
+        Err(io::Error::other("the record failed").into())
     }
 
     fn fds(&self) -> Vec<BorrowedFd<'_>> {
