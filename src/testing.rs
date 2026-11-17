@@ -290,7 +290,7 @@ impl Manager {
 
     /// How many file descriptors the hand-over under `key` holds in its queue sockets, those of its
     /// state included, in its items, as a service stored them with
-    /// [`Handover::store`](crate::Handover::store).
+    /// [`Store::hand_over`](crate::Store::hand_over).
     ///
     /// The queue sockets give their file descriptors up as they are read, so this takes them out
     /// and puts them back in queue sockets of its own, which take their places in the store. It
@@ -594,7 +594,7 @@ mod tests {
         let manager = Manager::new().unwrap();
         let store = crate::Store::new(manager.notifier().unwrap(), "test", 2).unwrap();
         let items = [(1, Fds(vec![pipe().1])), (2, Fds(vec![pipe().1, pipe().1]))];
-        store.handover().store(&[][..], items).unwrap();
+        store.hand_over(&[][..], items).unwrap();
 
         assert_eq!(manager.stored_fds("test").unwrap(), 3);
         assert_eq!(manager.stored_fds("test").unwrap(), 3);

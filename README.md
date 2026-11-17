@@ -36,11 +36,10 @@ D-Bus or Varlink:
 * [`Notifier`] tells systemd that the service is ready, among other things, and stores file
   descriptors in its store.
 * [`Store`] hands the service over to its next instance. In the instance that stops,
-  [`Store::handover`] starts a [`Handover`], and [`Handover::store`] stores the state of the service
-  and items, such as the connections of its clients, each a record of bytes and file descriptors,
-  however many there are. In the next instance, [`Store::take_over`] takes them over, as a
-  [`Restored`]. A hand-over is stored whole and taken over whole, or either fails: nothing of it
-  is left out.
+  [`Store::hand_over`] stores the state of the service and items, such as the connections of its
+  clients, each a record of bytes and file descriptors, however many there are. In the next
+  instance, [`Store::take_over`] takes them over, as a [`Restored`]. A hand-over is stored whole
+  and taken over whole, or either fails: nothing of it is left out.
 
 A protocol takes part through two traits, [`Save`] and [`Restore`], which the hand-overs of its
 connections implement, so that a service hands those over as they are. The `testing` feature adds
@@ -93,7 +92,7 @@ fn main() -> zoter::Result<()> {
 
     // Stop taking requests, finish those taken, and hand the state and all of the clients over.
     let clients = clients.iter().map(|(id, client)| (*id, client));
-    store.handover().store(b"the state".to_vec(), clients)?;
+    store.hand_over(b"the state".to_vec(), clients)?;
 
     Ok(())
 }
@@ -166,10 +165,8 @@ In development: the API can change from one minor version to the next.
 [`Notifier`]: https://docs.rs/zoter/latest/zoter/struct.Notifier.html
 [`Store`]: https://docs.rs/zoter/latest/zoter/struct.Store.html
 [`Store::from_env`]: https://docs.rs/zoter/latest/zoter/struct.Store.html#method.from_env
-[`Store::handover`]: https://docs.rs/zoter/latest/zoter/struct.Store.html#method.handover
+[`Store::hand_over`]: https://docs.rs/zoter/latest/zoter/struct.Store.html#method.hand_over
 [`Store::take_over`]: https://docs.rs/zoter/latest/zoter/struct.Store.html#method.take_over
-[`Handover`]: https://docs.rs/zoter/latest/zoter/struct.Handover.html
-[`Handover::store`]: https://docs.rs/zoter/latest/zoter/struct.Handover.html#method.store
 [`Restored`]: https://docs.rs/zoter/latest/zoter/struct.Restored.html
 [`Save`]: https://docs.rs/zoter/latest/zoter/trait.Save.html
 [`Restore`]: https://docs.rs/zoter/latest/zoter/trait.Restore.html

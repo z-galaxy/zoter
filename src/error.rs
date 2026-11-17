@@ -69,15 +69,15 @@ pub enum Error {
     },
     /// The store has no room for the file descriptors of this hand-over.
     ///
-    /// [`Handover::store`](crate::Handover::store) fails with it. Raising the service's
+    /// [`Store::hand_over`](crate::Store::hand_over) fails with it. Raising the service's
     /// `FileDescriptorStoreMax=` makes room for later hand-overs. Converted into an [`io::Error`],
     /// it has the kind [`io::ErrorKind::StorageFull`].
     StoreFull,
     /// The hand-over state or an item could not be saved. `item` identifies the item, or is `None`
     /// for the state. `source` contains the error returned by `Save::save`, if it was called.
     ///
-    /// [`Handover::store`](crate::Handover::store) fails with it and stores nothing. Converted into
-    /// an [`io::Error`], it has the kind [`io::ErrorKind::InvalidInput`].
+    /// [`Store::hand_over`](crate::Store::hand_over) fails with it and stores nothing. Converted
+    /// into an [`io::Error`], it has the kind [`io::ErrorKind::InvalidInput`].
     Unsaved {
         /// The id of the item, or `None` for the state.
         item: Option<u64>,
@@ -104,8 +104,8 @@ pub enum Error {
     /// The service manager did not process the messages sent to it in time.
     ///
     /// [`Notifier::barrier`](crate::Notifier::barrier) fails with it.
-    /// [`Handover::store`](crate::Handover::store) waits for systemd to process what it stored, and
-    /// fails with it too. Converted into an [`io::Error`], it has the kind
+    /// [`Store::hand_over`](crate::Store::hand_over) waits for systemd to process what it stored,
+    /// and fails with it too. Converted into an [`io::Error`], it has the kind
     /// [`io::ErrorKind::TimedOut`].
     TimedOut,
 }

@@ -110,20 +110,19 @@ async fn serve(mut passed: zoter::Passed) -> zoter::Result<()> {
     store.notifier().notify("READY=1")?;
 
     sigterm.await;
-    let handover = store.handover();
     // The service's own async work: stop taking requests, finish those it took, and take each
     // connection apart. Bounded by a timeout of the service's choosing.
     let (state, connections) = server.pause().await?;
     // Lays the hand-over out in the store, waits for systemd to have dealt with it, and returns.
     let items = connections.iter().map(|(id, connection)| (*id, connection));
-    let stored = handover.store(state.encode(), items)?;
+    let stored = store.hand_over(state.encode(), items)?;
 
     Ok(())
 }
 ```
 
 systemd starts the next instance with the sockets of socket activation and what was stored, and
-`Store::take_over` gives back what `Handover::store` stored. The unit needs
+`Store::take_over` gives back what `Store::hand_over` stored. The unit needs
 `FileDescriptorStoreMax=` of 2 at least (the state memfd and one queue socket), systemd 254 or
 later (for `$FDSTORE`), and a socket unit, so that systemd keeps the listening socket, and the
 clients that connect meanwhile, while no instance runs. Without the first two there is no `Store`:
@@ -245,26 +244,10 @@ impl Store {
     /// FDs. It fails with `Error::InvalidHandover` if FDs of the state or of an item are missing
     /// for another reason.
     pub fn take_over(&mut self, passed: &mut Passed) -> zoter::Result<Option<Restored>>;
-    /// Start a hand-over to the next instance.
-    pub fn handover(self) -> Handover;
-}
-```
-
-`take_over` removes the FDs from the store before it looks at them, as busd does, so that a
-hand-over that the next instance fails on, or crashes on, isn't found by the one after it.
-
-### `Handover`: what a service hands over
-
-```rust
-/// A hand-over to the next instance, which `Store::handover` started.
-#[derive(Debug)]
-pub struct Handover { /* the store */ }
-
-impl Handover {
-    pub fn notifier(&self) -> &Notifier;
-    /// Store `state`, and `items`, each under an id that the crate doesn't look at, so that the
-    /// state can refer to it, for the next instance, and wait for systemd to have dealt with it.
-    pub fn store<S, I, T>(self, state: S, items: I) -> zoter::Result<Stored>
+    /// Hand over to the next instance: store `state`, and `items`, each under an id that the crate
+    /// doesn't look at, so that the state can refer to it, for the next instance, and wait for
+    /// systemd to have dealt with it.
+    pub fn hand_over<S, I, T>(self, state: S, items: I) -> zoter::Result<Stored>
     where
         S: Save,
         I: IntoIterator<Item = (u64, T)>,
@@ -272,12 +255,14 @@ impl Handover {
 }
 ```
 
-The service starts the hand-over before it stops serving, so that it finds out first if it can't
-hand over, and gives the state and the items to `store` once it stopped: a hand-over that held them
-from its start would hold borrows of what the service makes later, which its drop would outlive.
-Items of different types go as `&dyn Save` or `Box<dyn Save>`.
+`take_over` removes the FDs from the store before it looks at them, as busd does, so that a
+hand-over that the next instance fails on, or crashes on, isn't found by the one after it.
 
-`store` either stores the state and every item, or fails. It fails with `Error::Unsaved` if the
+The service found out whether it can hand over as it created the store, so it gives `hand_over`
+all of the hand-over at once, once it stopped serving: its state and its items. Items of different
+types go as `&dyn Save` or `Box<dyn Save>`.
+
+`hand_over` either stores the state and every item, or fails. It fails with `Error::Unsaved` if the
 state or an item can't be saved, or if its `save` fails. The error names the id of the item, and
 it happens before anything is stored. It fails with `Error::StoreFull` if the FDs don't fit in the
 store, and the message names `FileDescriptorStoreMax=`. It fails with the error of queueing or
@@ -511,8 +496,8 @@ lands first; zbus and busd then follow, in that order, and zlink alongside them.
   their counts, so that the connection that takes over (`Builder::take_over`, then `name` and
   `serve_at` as usual) neither requests those names nor adds those rules again. How the streams
   of proxies take part, whose messages are signals, is for zbus's own design of it. A service
-  then hands its connection over as an item of `zoter::Handover`, with its own state, which it
-  saves its own way.
+  then hands its connection over as an item of its hand-over (`Store::hand_over`), with its own
+  state, which it saves its own way.
 
 ### zlink
 
@@ -534,8 +519,8 @@ With a feature on Linux, with `std`, as the hand-over of zbus is:
   or that was upgraded, is closed, as nothing generic hands those over; a later version can let a
   service hand them over. `Server` gets a way to serve connections that were taken over along
   with those it accepts.
-- A service hands its connections over as items of `zoter::Handover`, under their ids, and its
-  own state its own way: `Stopped` gives the service back for that.
+- A service hands its connections over as items of its hand-over (`Store::hand_over`), under
+  their ids, and its own state its own way: `Stopped` gives the service back for that.
 
 ### busd
 
@@ -545,7 +530,7 @@ With a feature on Linux, with `std`, as the hand-over of zbus is:
   `RestoredItem::restore::<connection::Handover>`, by id, and listens on the one socket of socket
   activation left in `Passed`. `Bus::hand_over_to_systemd` keeps busd's own rule (no hand-over
   without socket activation) and timeout, and stores each client's `connection::Handover` under
-  its id, through `Handover::store`. `queue`, `take_queued`, `take_fds`, `bytes_at`, `Reserve`,
+  its id, through `Store::hand_over`. `queue`, `take_queued`, `take_fds`, `bytes_at`, `Reserve`,
   `StoredFds` and their constants go to the crate, and `fit` goes. Its module docs keep what is
   the bus's, and point to the crate's for the rest.
 - The state loses `Stored` (where each record and its FDs are), which the crate's table says now,
@@ -573,22 +558,26 @@ restarts. It is free on crates.io, and its repository is `z-galaxy/zoter`.
 6. Warnings go through `tracing`, a default feature.
 7. zlink closes the connections whose replies stream, and the upgraded ones, as it hands over,
    rather than wait for them: a later version can let a service hand them over.
-8. A hand-over is stored whole or `Handover::store` fails, and taken over whole or
+8. A hand-over is stored whole or `Store::hand_over` fails, and taken over whole or
    `Store::take_over` fails. The first version fitted the items under the limit of open FDs of the
    next instance, with the FDs that each would open there and those to keep spare described by the
    caller (`set_extra_fds_per_item`, `set_spare_fds`, `Store::set_fd_limit`), and left out what
    didn't fit, couldn't be saved or was missing (`Stored::left_out`, `LeftOut`,
    `Restored::left_out`). That went: a caller can't well describe FDs that it opens later, and
    clients that are dropped silently are a footgun, where an error says which setting to raise.
+9. The hand-over goes through the `Store` itself (`Store::hand_over`). The first version had
+   `Store::handover` start a `Handover`, before the service stopped serving, so that the service
+   found out first if it couldn't hand over. Creating the `Store` tells that now, which left
+   `Handover` nothing to do, so it went.
 
 ## The plan
 
 1. This repository: the scaffolding, from zruntime (CI, release-plz, commitlint, git hooks,
    rustfmt, editorconfig, codespell, renovate, AGENTS.md and CLAUDE.md, CONTRIBUTING.md,
    SECURITY.md, the license, the README); then `Save` and `Restore`; then `Passed` and `Notifier`,
-   moved from busd with their tests; then the memfd, the queue sockets, `Store`, `Handover` and
-   `Restored`; then `testing`, and an example service that restarts with its clients, which the
-   tests run under the fake manager.
+   moved from busd with their tests; then the memfd, the queue sockets, `Store` and `Restored`;
+   then `testing`, and an example service that restarts with its clients, which the tests run
+   under the fake manager.
 2. zbus: the hand-over becomes Linux-only, and `connection::Handover` implements the traits, in
    place of its own methods.
 3. busd: on the crate and on zbus's impls.

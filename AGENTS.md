@@ -63,8 +63,8 @@ src/
 ├── passed.rs      # Passed: the FDs that systemd passes, as sd_listen_fds(3) takes them
 ├── notifier.rs    # Notifier: $NOTIFY_SOCKET, as sd_notify(3) has it, storing FDs and barriers
 ├── limit.rs       # raise_fd_limit
-├── handover.rs    # Handover: a hand-over that a store started; Stored: what went
-├── store.rs       # Store: handover, take_over and storing, queueing the FDs, the reserved FDs
+├── store.rs       # Store: take_over and hand_over, queueing the FDs, the reserved FDs;
+│                  # Stored: what a hand-over stored
 ├── store/tests.rs # Its tests, against testing::Manager in the test process
 ├── restored.rs    # Restored and RestoredItem: what was handed over, read in place
 ├── layout.rs      # The format of the memfd: header, table of the items, records
@@ -76,7 +76,7 @@ tests/restart.rs   # [testing feature] A restart end to end: the test binary is 
 benches/handover.rs # [testing feature] What storing a hand-over and taking it over cost
 ```
 
-`Handover::store` lays a hand-over out in one memfd, stored under `<key>/state`, and puts the FDs
+`Store::hand_over` lays a hand-over out in one memfd, stored under `<key>/state`, and puts the FDs
 of the state and of the items in the queues of sockets, stored under `<key>/fds`, as many as that
 takes. `Store::take_over` takes the names of its key out of `Passed`, removes them from the store
 first, maps the memfd, and takes the FDs out of the queues by their indexes. The tests that take

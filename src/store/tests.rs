@@ -32,7 +32,7 @@ fn round_trip() {
     let twice = Item::new(b"", twice);
     let items: [(u64, &dyn Save); 4] = [(1, &bytes), (2, &write_a), (3, &many), (u64::MAX, &twice)];
     let state = Item::new(b"state", vec![write_b]);
-    let stored = store(&manager).handover().store(state, items).unwrap();
+    let stored = store(&manager).hand_over(state, items).unwrap();
     assert_eq!(stored.items(), 4);
     assert_eq!(stored.fds(), 1 + 1 + MAX_FDS + 10 + 2);
     assert_eq!(manager.stored_names(), ["test/state", "test/fds"]);
@@ -134,8 +134,7 @@ fn unsaved_items_fail_the_hand_over() {
             (2, unsaved),
             (3, Box::new(Item::new(b"three", vec![pipe().1]))),
         ];
-        let handover = store(&manager).handover();
-        let error = handover.store(&[][..], items).unwrap_err();
+        let error = store(&manager).hand_over(&[][..], items).unwrap_err();
         let Error::Unsaved {
             item: Some(2),
             source,
@@ -161,7 +160,7 @@ fn missing_fds_fail_the_take_over() {
         (2, Item::new(b"two", vec![pipe().1, pipe().1])),
         (3, Item::new(b"three", vec![pipe().1])),
     ];
-    store(&manager).handover().store(&[][..], items).unwrap();
+    store(&manager).hand_over(&[][..], items).unwrap();
 
     // The second file descriptor, the first of the second item, goes missing.
     let mut stored = manager.stored().unwrap();
@@ -201,7 +200,7 @@ fn take_over_over_the_fd_limit() {
         .take(32)
         .collect();
     let items = [(1, Item::new(b"many", fds))];
-    store(&manager).handover().store(&[][..], items).unwrap();
+    store(&manager).hand_over(&[][..], items).unwrap();
     let mut passed = manager.passed().unwrap();
     let mut store = store(&manager);
     // Room for a few file descriptors more than are open, which the manager adds to as it closes
@@ -226,8 +225,7 @@ fn unsaved_state() {
         (Box::new(Failing(pipe().1)), true),
     ] {
         let manager = Manager::new().unwrap();
-        let handover = store(&manager).handover();
-        let error = handover.store(state, NO_ITEMS).unwrap_err();
+        let error = store(&manager).hand_over(state, NO_ITEMS).unwrap_err();
         let Error::Unsaved { item: None, source } = &error else {
             panic!("{error:?}");
         };
@@ -254,28 +252,28 @@ fn no_store_without_room() {
     Store::new(manager.notifier().unwrap(), KEY, MIN_STORE).unwrap();
 }
 
-/// A hand-over starts before the service has what it hands over, which it hands over borrowed, as
-/// an async service has it once it stopped taking requests.
+/// A service hands over what it borrows: its state, and its items out of an iterator over what it
+/// holds, as an async service has them once it stopped taking requests.
 #[test]
-fn items_made_once_started() {
+fn borrowed_state_and_items() {
     let manager = Manager::new().unwrap();
-    let handover = store(&manager).handover();
+    let store = store(&manager);
     let clients = [(4, pipe().1), (2, pipe().1)];
     let state = b"state".to_vec();
     let items = clients.iter().map(|(id, client)| (*id, client));
-    let stored = handover.store(&state, items).unwrap();
+    let stored = store.hand_over(&state, items).unwrap();
     assert_eq!((stored.items(), stored.fds()), (2, 2));
 
     assert_eq!(ids(take_over(&manager)), [4, 2]);
 }
 
-/// A hand-over is `Send`, so that an async service can hold one across the awaits of stopping, on
-/// a runtime of several threads.
+/// A store is `Send`, so that an async service can hold it across the awaits of serving and of
+/// stopping, on a runtime of several threads.
 #[test]
-fn handover_is_send() {
+fn store_is_send() {
     fn send<T: Send>() {}
 
-    send::<Handover>();
+    send::<Store>();
 }
 
 #[test]

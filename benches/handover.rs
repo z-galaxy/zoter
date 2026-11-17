@@ -7,17 +7,17 @@
 //! instances are this process, one after the other, and the clients keep their ends of the sockets
 //! open throughout.
 //!
-//! - `store/100-clients`, `store/1000-clients`: `Handover::store` of the state of the service, 64
+//! - `store/100-clients`, `store/1000-clients`: `Store::hand_over` of the state of the service, 64
 //!   bytes for each client, and of an item for each, with a record of 256 bytes, from the start of
-//!   storing until the manager dealt with what was stored, which `store` waits for.
+//!   storing until the manager dealt with what was stored, which `hand_over` waits for.
 //! - `take-over/100-clients`, `take-over/1000-clients`: `Store::take_over` of such a hand-over, out
 //!   of what the manager passes the next instance, and the restoring of each item, its record and
 //!   its socket.
 //!
 //! What a round needs besides, which the service doesn't do as it hands over or takes over, is done
-//! between the rounds, untimed: creating the store of an instance, starting a hand-over, which only
-//! checks the store, the manager passing the next instance what is stored, and closing what was
-//! taken over. The rounds check, untimed, that every item was stored and taken over.
+//! between the rounds, untimed: creating the store of an instance, the manager passing the next
+//! instance what is stored, and closing what was taken over. The rounds check, untimed, that every
+//! item was stored and taken over.
 
 #[cfg(target_os = "linux")]
 criterion::criterion_main!(linux::benches);
@@ -102,10 +102,10 @@ mod linux {
         /// How long storing a hand-over of the service takes, from the start of storing until the
         /// manager dealt with what was stored.
         fn time_store(&self) -> Duration {
-            let handover = self.store().handover();
+            let store = self.store();
             let start = Instant::now();
-            let stored = handover
-                .store(&self.state[..], self.items())
+            let stored = store
+                .hand_over(&self.state[..], self.items())
                 .expect("the hand-over is stored");
             let time = start.elapsed();
             self.check(&stored);
@@ -117,9 +117,9 @@ mod linux {
 
         /// How long taking a hand-over of the service over takes, and restoring its items.
         fn time_take_over(&self) -> Duration {
-            let handover = self.store().handover();
-            let stored = handover
-                .store(&self.state[..], self.items())
+            let stored = self
+                .store()
+                .hand_over(&self.state[..], self.items())
                 .expect("the hand-over is stored");
             self.check(&stored);
             let mut passed = self.manager.passed().expect("the manager passes the store");

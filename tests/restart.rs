@@ -89,10 +89,9 @@ fn serve() {
 
     // The standard input ends as the test stops this instance.
     io::stdin().read_to_end(&mut Vec::new()).unwrap();
-    let handover = store.handover();
     let state = count.to_le_bytes();
-    let stored = handover
-        .store(&state[..], [(CLIENT, client.as_fd())])
+    let stored = store
+        .hand_over(&state[..], [(CLIENT, client.as_fd())])
         .unwrap();
     assert_eq!((stored.items(), stored.fds()), (1, 1));
 }

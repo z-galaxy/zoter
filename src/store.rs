@@ -1,5 +1,5 @@
 //! The file descriptor store of a service, through which it hands over to its next instance:
-//! [`Store`].
+//! [`Store`], and what a hand-over stored: [`Stored`].
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -15,7 +15,7 @@ use rustix::{
 };
 
 use crate::{
-    Error, Handover, Notifier, Passed, Restored, Result, Save, Stored,
+    Error, Notifier, Passed, Restored, Result, Save,
     layout::{self, Entry, Layout},
     memfd,
     notifier::MAX_FDS,
@@ -28,9 +28,11 @@ use crate::{
 ///
 /// systemd keeps the store for the service across its restarts: what the service stores in it,
 /// systemd passes the next instance as it starts it, along with the sockets of socket activation.
-/// [`handover`](Self::handover) starts a [`Handover`], which stores what the service hands over as
-/// it stops, and [`take_over`](Self::take_over) gives it back in the next instance, under the same
-/// key, as a [`Restored`]. Several keys keep several hand-overs apart, in one store.
+/// [`hand_over`](Self::hand_over) stores what the service hands over as it stops: its state, and
+/// items, such as the connections of its clients, under ids of its own, each what [`Save`] saves,
+/// a record of bytes and file descriptors. [`take_over`](Self::take_over) gives it back in the
+/// next instance, under the same key, as a [`Restored`]. Several keys keep several hand-overs
+/// apart, in one store.
 ///
 /// The unit of the service needs `FileDescriptorStoreMax=` of 2 at least, for systemd to keep a
 /// store, and systemd 254 or later, which tells the service how many file descriptors the store
@@ -51,9 +53,9 @@ use crate::{
 ///
 /// # Limits
 ///
-/// A hand-over is stored whole, or [`Handover::store`] fails, and it is taken over whole, or
-/// [`take_over`](Self::take_over) fails: nothing of it is left out. The next instance takes the
-/// file descriptors out of the queues under its soft limit of open files, which
+/// A hand-over is stored whole, or [`hand_over`](Self::hand_over) fails, and it is taken over
+/// whole, or [`take_over`](Self::take_over) fails: nothing of it is left out. The next instance
+/// takes the file descriptors out of the queues under its soft limit of open files, which
 /// [`raise_fd_limit`](crate::raise_fd_limit) raises to the hard one, and fails to take over if
 /// they don't fit under it. The store keeps a few file descriptors open from its creation on, which
 /// it gives up for those that storing a hand-over opens, so that storing can't fail for want of
@@ -206,22 +208,46 @@ impl Store {
         }))
     }
 
-    /// Start a hand-over to the next instance through the store, which
-    /// [stores](Handover::store) the state of the service and its items once the service stopped
-    /// taking requests.
+    /// Hand over to the next instance: store `state`, the state of the service, and `items`, in
+    /// their order, each under its id, for the next instance, and wait for systemd to have dealt
+    /// with them.
     ///
-    /// This consumes the store and its [notifier](Self::notifier), unless the service cloned the
-    /// notifier.
-    pub fn handover(self) -> Handover {
-        Handover::new(self)
+    /// The service does this once it stopped taking requests. This consumes the store and its
+    /// [notifier](Self::notifier), unless the service cloned the notifier.
+    ///
+    /// The state of a service that has none is `&[][..]`. zoter doesn't look at the ids, nor
+    /// checks that they are unique: it gives each back with its item, for the state to refer to
+    /// the item by. The items are of any type, borrowed or owned, those of different types as
+    /// `&dyn Save` or `Box<dyn Save>`.
+    ///
+    /// Either the whole hand-over is stored, or this fails: no part of it is left out. It fails
+    /// with [`Error::Unsaved`] if the state or an item can't be saved, or if saving its record
+    /// fails. The error names the id of the item, and nothing is stored. It fails with
+    /// [`Error::StoreFull`] if the file descriptors don't fit in the store. The service's
+    /// `FileDescriptorStoreMax=` makes the store hold more. It fails with [`Error::Io`] for any I/O
+    /// error while storing the memfd or the file descriptors, or while queueing them for the
+    /// store. It fails with [`Error::TimedOut`] if systemd takes longer than 5 s to process what
+    /// was stored. A hand-over that fails after the memfd was stored may leave part of itself in
+    /// the store. The next instance fails to take that part over, and removes it from the store
+    /// like any other hand-over.
+    pub fn hand_over<S, I, T>(self, state: S, items: I) -> Result<Stored>
+    where
+        S: Save,
+        I: IntoIterator<Item = (u64, T)>,
+        T: Save,
+    {
+        let items: Vec<_> = items.into_iter().collect();
+        // The rest takes no generics, so that it is built once, whatever the types.
+        let items: Vec<_> = items
+            .iter()
+            .map(|(id, item)| (*id, item as &dyn Save))
+            .collect();
+
+        self.store_all(&state, &items)
     }
 
-    /// Store `state` and `items`, as [`Handover::store`] tells.
-    pub(crate) fn hand_over(
-        mut self,
-        state: &dyn Save,
-        items: &[(u64, &dyn Save)],
-    ) -> Result<Stored> {
+    /// Store `state` and `items`, as [`hand_over`](Self::hand_over) tells.
+    fn store_all(mut self, state: &dyn Save, items: &[(u64, &dyn Save)]) -> Result<Stored> {
         // The store takes the memfd, and as many queue sockets as it has room for besides: one at
         // least, as `new` checked.
         let room = self.max - 1;
@@ -309,6 +335,25 @@ impl Store {
     /// under.
     fn name(&self, kind: &str) -> String {
         format!("{}/{kind}", self.key)
+    }
+}
+
+/// What [`Store::hand_over`] stored: all of the hand-over.
+#[derive(Debug)]
+pub struct Stored {
+    items: usize,
+    fds: usize,
+}
+
+impl Stored {
+    /// How many items were stored, whole.
+    pub fn items(&self) -> usize {
+        self.items
+    }
+
+    /// How many file descriptors were stored, those of the state included.
+    pub fn fds(&self) -> usize {
+        self.fds
     }
 }
 

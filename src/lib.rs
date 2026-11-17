@@ -12,8 +12,6 @@ mod log;
 
 mod error;
 pub use error::{Error, Result};
-mod handover;
-pub use handover::{Handover, Stored};
 mod layout;
 mod limit;
 pub use limit::raise_fd_limit;
@@ -28,7 +26,7 @@ pub use restored::{Restored, RestoredItem};
 mod save;
 pub use save::{Restore, Save};
 mod store;
-pub use store::Store;
+pub use store::{Store, Stored};
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
