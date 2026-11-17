@@ -102,10 +102,7 @@ mod linux {
         /// How long storing a hand-over of the service takes, from the start of storing until the
         /// manager dealt with what was stored.
         fn time_store(&self) -> Duration {
-            let handover = self
-                .store()
-                .handover()
-                .expect("the store takes a hand-over");
+            let handover = self.store().handover();
             let start = Instant::now();
             let stored = handover
                 .store(&self.state[..], self.items())
@@ -120,10 +117,7 @@ mod linux {
 
         /// How long taking a hand-over of the service over takes, and restoring its items.
         fn time_take_over(&self) -> Duration {
-            let handover = self
-                .store()
-                .handover()
-                .expect("the store takes a hand-over");
+            let handover = self.store().handover();
             let stored = handover
                 .store(&self.state[..], self.items())
                 .expect("the hand-over is stored");
@@ -156,7 +150,7 @@ mod linux {
         fn store(&self) -> Store {
             let notifier = self.manager.notifier().expect("a notifier of the manager");
 
-            Store::new(notifier, KEY, Some(self.manager.store_max())).expect("a store")
+            Store::new(notifier, KEY, self.manager.store_max()).expect("a store")
         }
 
         /// The items of a hand-over of the service: its connections, under the numbers of their

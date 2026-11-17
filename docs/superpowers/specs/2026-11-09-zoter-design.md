@@ -81,14 +81,17 @@ fn main() -> zoter::Result<()> {
 }
 
 async fn serve(mut passed: zoter::Passed) -> zoter::Result<()> {
-    // `None` without `$NOTIFY_SOCKET`, as when systemd didn't start the service.
-    let mut store = zoter::Store::from_env("example")?;
+    // Fails with `Error::NoManager` without `$NOTIFY_SOCKET`, as when systemd didn't start the
+    // service, which serves without a hand-over then. Fails otherwise if systemd keeps no store
+    // for the service that can hold a hand-over.
+    let mut store = match zoter::Store::from_env("example") {
+        Ok(store) => store,
+        Err(zoter::Error::NoManager) => return serve_without_a_store(passed).await,
+        Err(e) => return Err(e),
+    };
     // Takes the FDs stored under `example/` out of `passed`, removes them from the store, and
     // reads the hand-over that they hold, if any.
-    let restored = match &mut store {
-        Some(store) => store.take_over(&mut passed)?,
-        None => None,
-    };
+    let restored = store.take_over(&mut passed)?;
     // What is left in `passed` is the sockets of socket activation, by the names of their units.
     let listener = passed.take("example.socket");
     let mut server = match restored {
@@ -104,24 +107,10 @@ async fn serve(mut passed: zoter::Passed) -> zoter::Result<()> {
         }
         None => Server::new(listener),
     };
-    if let Some(store) = &store {
-        store.notifier().notify("READY=1")?;
-    }
+    store.notifier().notify("READY=1")?;
 
     sigterm.await;
-    // Without a store to hand over through, the service shuts down as it does without systemd, as
-    // it does with one that can't take a hand-over, which it finds out before it stops serving.
-    let Some(store) = store else {
-        return server.shut_down().await;
-    };
-    let handover = match store.handover() {
-        Ok(handover) => handover,
-        Err(e) => {
-            warn!("Not handing over to the next instance: {e}");
-
-            return server.shut_down().await;
-        }
-    };
+    let handover = store.handover();
     // The service's own async work: stop taking requests, finish those it took, and take each
     // connection apart. Bounded by a timeout of the service's choosing.
     let (state, connections) = server.pause().await?;
@@ -137,7 +126,11 @@ systemd starts the next instance with the sockets of socket activation and what 
 `Store::take_over` gives back what `Handover::store` stored. The unit needs
 `FileDescriptorStoreMax=` of 2 at least (the state memfd and one queue socket), systemd 254 or
 later (for `$FDSTORE`), and a socket unit, so that systemd keeps the listening socket, and the
-clients that connect meanwhile, while no instance runs.
+clients that connect meanwhile, while no instance runs. Without the first two there is no `Store`:
+`Store::from_env` fails. Its error tells a process that systemd takes no notifications from
+(`Error::NoManager`), as one that it doesn't run, from a service that it does take them from but
+keeps no store for, as one of `Type=notify` (`Error::NoStore`). A service that also runs without
+systemd goes on without a hand-over on the former.
 
 ## API
 
@@ -237,23 +230,23 @@ stay strings (`"READY=1"`, `"STOPPING=1"`, `"EXTEND_TIMEOUT_USEC=…"`); typed s
 pub struct Store { /* notifier, key, $FDSTORE, the reserved FDs */ }
 
 impl Store {
-    /// The store of the service that `$NOTIFY_SOCKET` names, taking `$FDSTORE` FDs, if set.
-    pub fn from_env(key: &str) -> zoter::Result<Option<Self>>;
-    /// The store of the service that `notifier` reaches, taking `max` FDs.
-    pub fn new(notifier: Notifier, key: &str, max: Option<usize>) -> zoter::Result<Self>;
+    /// The store that systemd keeps for the service, which `$NOTIFY_SOCKET` reaches and which
+    /// takes `$FDSTORE` FDs. It fails with `Error::NoManager` if `$NOTIFY_SOCKET` is unset or
+    /// empty: systemd takes no notifications from the process, as when it doesn't run it. It
+    /// fails with `Error::NoStore` if `$FDSTORE` is unset or not a number.
+    pub fn from_env(key: &str) -> zoter::Result<Self>;
+    /// The store of the service that `notifier` reaches, taking `max` FDs. It fails with
+    /// `Error::StoreTooSmall` if `max` is less than 2 (the state memfd and a queue socket).
+    pub fn new(notifier: Notifier, key: &str, max: usize) -> zoter::Result<Self>;
     pub fn notifier(&self) -> &Notifier;
-    /// How many FDs the store takes, as `FileDescriptorStoreMax=` of the unit sets it.
-    pub fn max(&self) -> Option<usize>;
     /// Take over from the previous instance: take the FDs stored under the key out of `passed`,
     /// remove them from the store, and read the whole hand-over that they hold, if any. It fails
     /// with `Error::Io` of `EMFILE` if the FDs don't fit under the process's soft limit of open
     /// FDs. It fails with `Error::InvalidHandover` if FDs of the state or of an item are missing
     /// for another reason.
     pub fn take_over(&mut self, passed: &mut Passed) -> zoter::Result<Option<Restored>>;
-    /// Start a hand-over to the next instance. It fails with `Error::NoStore` or
-    /// `Error::StoreTooSmall` if the store can't hold one (the state memfd and a queue socket).
-    /// The error says why, and which unit setting to change. It logs nothing.
-    pub fn handover(self) -> zoter::Result<Handover>;
+    /// Start a hand-over to the next instance.
+    pub fn handover(self) -> Handover;
 }
 ```
 
@@ -351,6 +344,8 @@ pub enum Error {
     Environment(String),
     /// A store key or an FD name that zoter does not accept.
     InvalidName(String),
+    /// No service manager takes notifications from the process.
+    NoManager,
     /// systemd keeps no store for the service.
     NoStore,
     /// The store takes fewer FDs than any hand-over needs.
@@ -371,10 +366,12 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 ```
 
-The variants are the cases that a caller tells apart. Some name a unit setting to change
-(`NoStore`, `StoreTooSmall`, `StoreFull`). Some mean that the next instance starts afresh without
-the hand-over (`InvalidHandover`, `UnsupportedHandover`). `Io` is the error that the system
-returned. If there is a setting to change, the message names it. Each variant converts into an
+The variants are the cases that a caller tells apart. `NoManager` is the case of a process that
+systemd doesn't run, or takes no notifications from, which a service that also runs without
+systemd goes on from. Some name a unit setting to change (`NoStore`, `StoreTooSmall`,
+`StoreFull`). Some mean that the next instance starts afresh without the hand-over
+(`InvalidHandover`, `UnsupportedHandover`). `Io` is the error that the system returned. If there
+is a setting to change, the message names it. Each variant converts into an
 `io::Error` of a matching kind (`InvalidData`, `InvalidInput`, `Unsupported`, `StorageFull` or
 `TimedOut`), and `Io` converts into the wrapped error itself. So a service whose functions return
 `io::Result` can use `?` on an `Error` too.
@@ -418,6 +415,18 @@ the next instance as two. The memfd is stored first, then the queue sockets.
 
 ## When things fail
 
+Creating the store:
+
+- systemd takes no notifications from the process (`$NOTIFY_SOCKET` is unset or empty), as when
+  it doesn't run it: `Store::from_env` fails with `Error::NoManager`.
+- systemd takes notifications from the service, but keeps no store for it (`$FDSTORE` is unset or
+  not a number): `Store::from_env` fails with `Error::NoStore`.
+- The store takes fewer than 2 FDs: `Store::from_env` and `Store::new` fail with
+  `Error::StoreTooSmall`. `Store::new` alone judges the number, so a `$FDSTORE` of 0, which systemd
+  never sets, fails as a `max` of 0 does.
+
+Either way the service has no `Store`, so it neither takes over nor hands over.
+
 Taking over:
 
 - No `<key>/state`: nothing was handed over (`Ok(None)`), and queue sockets without it are closed.
@@ -432,9 +441,6 @@ Taking over:
 
 Handing over:
 
-- The store can't hold a hand-over (no `$FDSTORE`, or fewer than 2): `Store::handover` fails with
-  `Error::NoStore` or `Error::StoreTooSmall` before the service pauses. The service can then shut
-  down normally instead.
 - A state or an item that can't be saved, or whose `save` fails: `Error::Unsaved`. Nothing is
   stored.
 - Creating, filling or storing the memfd fails: an error, and all of the hand-over is dropped.
@@ -456,6 +462,7 @@ systemd does (one FD of each open file description, `FDSTOREREMOVE`, closing the
 gives it, under their names, and starts a service as systemd does: `Manager::command(program)`
 gives a `std::process::Command` with `$NOTIFY_SOCKET`, `$FDSTORE`, `$LISTEN_FDS` and
 `$LISTEN_FDNAMES` set, the passed FDs from 3 on, and `$LISTEN_PID` set to the PID of the service.
+It leaves `$FDSTORE` unset for a store that takes no FDs, as systemd does.
 For a service that runs in the test process, `Manager::notifier` and `Manager::passed` give what
 `Store::from_env` and `Passed::from_env` would. Tests wait for a state
 (`wait_for("READY=1", timeout)`), look at the store, and empty it, as a stop does. busd, zbus and

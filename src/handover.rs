@@ -5,11 +5,10 @@ use crate::{Notifier, Result, Save, Store};
 /// A hand-over of a service to its next instance, through its [`Store`], which
 /// [`Store::handover`] starts.
 ///
-/// Starting it fails if the store can't take a hand-over, so that the service finds out before it
-/// stops taking requests to hand over. [`store`](Self::store) then stores what the service hands
-/// over: its state, and items, such as the connections of its clients, under ids of its own, each
-/// what [`Save`] saves, a record of bytes and file descriptors. [`Store::take_over`] gives it back
-/// in the next instance, as a [`Restored`](crate::Restored).
+/// [`store`](Self::store) stores what the service hands over: its state, and items, such as the
+/// connections of its clients, under ids of its own, each what [`Save`] saves, a record of bytes
+/// and file descriptors. [`Store::take_over`] gives it back in the next instance, as a
+/// [`Restored`](crate::Restored).
 #[derive(Debug)]
 pub struct Handover {
     store: Store,

@@ -55,7 +55,7 @@ depends on no async runtime.
 ```rust
 use std::os::fd::OwnedFd;
 
-use zoter::{Passed, Store};
+use zoter::{Error, Passed, Store};
 
 fn main() -> zoter::Result<()> {
     // The next instance takes the file descriptors of a hand-over out of the store under this
@@ -65,14 +65,17 @@ fn main() -> zoter::Result<()> {
     // nothing took the file descriptors that systemd passed.
     let mut passed = unsafe { Passed::from_env() }?;
 
-    // `None` without `$NOTIFY_SOCKET`, as when systemd didn't start the service.
-    let mut store = Store::from_env("example")?;
+    // The store that systemd keeps for the service, which the units below have it keep. Without
+    // systemd there is none, and the example stops here. A service may as well serve on without a
+    // store then, and disconnect its clients as it stops.
+    let mut store = match Store::from_env("example") {
+        Ok(store) => store,
+        Err(Error::NoManager) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     // The file descriptors stored under `example/` are taken out of `passed`, and removed from the
     // store, and the hand-over that they hold is read, if there is one.
-    let restored = match &mut store {
-        Some(store) => store.take_over(&mut passed)?,
-        None => None,
-    };
+    let restored = store.take_over(&mut passed)?;
     // What is left in `passed` is the sockets of socket activation, by the names of their units.
     let _listener = passed.take("example.socket");
     // The clients that the previous instance handed over, each a socket here.
@@ -84,28 +87,13 @@ fn main() -> zoter::Result<()> {
             clients.push((id, item.restore()?));
         }
     }
-    if let Some(store) = &store {
-        store.notifier().notify("READY=1")?;
-    }
+    store.notifier().notify("READY=1")?;
 
     // Serve the clients, and the ones that connect, until systemd sends `SIGTERM`.
 
-    // Without a store to hand over through, the service shuts down as it does without systemd, as
-    // it does with one that can't take a hand-over.
-    let Some(store) = store else {
-        return Ok(());
-    };
-    let handover = match store.handover() {
-        Ok(handover) => handover,
-        Err(e) => {
-            eprintln!("Not handing over to the next instance: {e}");
-
-            return Ok(());
-        }
-    };
     // Stop taking requests, finish those taken, and hand the state and all of the clients over.
     let clients = clients.iter().map(|(id, client)| (*id, client));
-    handover.store(b"the state".to_vec(), clients)?;
+    store.handover().store(b"the state".to_vec(), clients)?;
 
     Ok(())
 }
@@ -133,7 +121,8 @@ FileDescriptorStoreMax=16
 
 `systemctl restart example` then restarts the service with its clients, which needs systemd 254 or
 later. A stop, or a start after a stop, doesn't keep them: systemd closes the store as the service
-stops for good.
+stops for good. Without `FileDescriptorStoreMax=` in the unit, or under an older systemd, there is
+no store, and [`Store::from_env`] fails with [`Error::NoStore`].
 
 ## Errors
 
@@ -141,6 +130,8 @@ The fallible functions of zoter return a [`zoter::Result`]. The one exception is
 which fails with the error that its [`Restore`] implementation chooses. An [`Error`] says what went
 wrong:
 
+* [`Error::NoManager`] means that systemd takes no notifications from the process, as when it
+  doesn't run it at all. A service that also runs without systemd goes on without a store then.
 * [`Error::NoStore`], [`Error::StoreTooSmall`] and [`Error::StoreFull`] name the unit setting to
   raise, `FileDescriptorStoreMax=`.
 * [`Error::InvalidHandover`] and [`Error::UnsupportedHandover`] mean that the next instance can't
@@ -174,6 +165,7 @@ In development: the API can change from one minor version to the next.
 [`Passed`]: https://docs.rs/zoter/latest/zoter/struct.Passed.html
 [`Notifier`]: https://docs.rs/zoter/latest/zoter/struct.Notifier.html
 [`Store`]: https://docs.rs/zoter/latest/zoter/struct.Store.html
+[`Store::from_env`]: https://docs.rs/zoter/latest/zoter/struct.Store.html#method.from_env
 [`Store::handover`]: https://docs.rs/zoter/latest/zoter/struct.Store.html#method.handover
 [`Store::take_over`]: https://docs.rs/zoter/latest/zoter/struct.Store.html#method.take_over
 [`Handover`]: https://docs.rs/zoter/latest/zoter/struct.Handover.html
@@ -184,6 +176,7 @@ In development: the API can change from one minor version to the next.
 [`testing::Manager`]: https://docs.rs/zoter/latest/zoter/testing/struct.Manager.html
 [`zoter::Result`]: https://docs.rs/zoter/latest/zoter/type.Result.html
 [`Error`]: https://docs.rs/zoter/latest/zoter/enum.Error.html
+[`Error::NoManager`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.NoManager
 [`Error::NoStore`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.NoStore
 [`Error::StoreTooSmall`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.StoreTooSmall
 [`Error::StoreFull`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.StoreFull

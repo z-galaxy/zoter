@@ -112,8 +112,8 @@ impl Manager {
 
     /// Have the store take `max` file descriptors, as `FileDescriptorStoreMax=` has systemd do.
     ///
-    /// The services that the manager starts from then on get it as `$FDSTORE`. What the store
-    /// keeps already stays.
+    /// The services that the manager starts from then on get it as `$FDSTORE`, or no `$FDSTORE` if
+    /// it is 0, as systemd keeps no store then. What the store keeps already stays.
     pub fn set_store_max(&mut self, max: usize) {
         self.shared.state().store_max = max;
     }
@@ -154,9 +154,10 @@ impl Manager {
     /// Arguments added to the command go to `program`. It runs with what [`passed`](Self::passed)
     /// gives as its file descriptors from 3 on, with `$LISTEN_FDS`, `$LISTEN_FDNAMES` and
     /// `$LISTEN_PID` telling of them, and with `$NOTIFY_SOCKET` naming the socket of the manager,
-    /// and `$FDSTORE` telling how many file descriptors the store takes. A shell runs `program` as
-    /// itself, so that `$LISTEN_PID` is the PID of `program`, which can't be known before it
-    /// starts. The command keeps duplicates of the file descriptors to pass until it is dropped.
+    /// and `$FDSTORE` telling how many file descriptors the store takes, unless it takes none. A
+    /// shell runs `program` as itself, so that `$LISTEN_PID` is the PID of `program`, which can't
+    /// be known before it starts. The command keeps duplicates of the file descriptors to pass
+    /// until it is dropped.
     pub fn command(&self, program: impl AsRef<OsStr>) -> Result<Command> {
         let passed = self.passed()?.into_vec();
         let count = passed.len();
@@ -189,9 +190,13 @@ impl Manager {
         ] {
             command.env_remove(var);
         }
-        command
-            .env("NOTIFY_SOCKET", &self.path)
-            .env("FDSTORE", self.store_max().to_string());
+        command.env("NOTIFY_SOCKET", &self.path);
+        // systemd tells of a store that takes file descriptors, and leaves the variable unset for
+        // a service without one.
+        match self.store_max() {
+            0 => command.env_remove("FDSTORE"),
+            max => command.env("FDSTORE", max.to_string()),
+        };
         if count > 0 {
             command
                 .env("LISTEN_FDS", count.to_string())
@@ -587,15 +592,15 @@ mod tests {
     #[test]
     fn stored_fds() {
         let manager = Manager::new().unwrap();
-        let store = crate::Store::new(manager.notifier().unwrap(), "test", Some(2)).unwrap();
+        let store = crate::Store::new(manager.notifier().unwrap(), "test", 2).unwrap();
         let items = [(1, Fds(vec![pipe().1])), (2, Fds(vec![pipe().1, pipe().1]))];
-        store.handover().unwrap().store(&[][..], items).unwrap();
+        store.handover().store(&[][..], items).unwrap();
 
         assert_eq!(manager.stored_fds("test").unwrap(), 3);
         assert_eq!(manager.stored_fds("test").unwrap(), 3);
         assert_eq!(manager.stored_fds("other").unwrap(), 0);
         let mut passed = manager.passed().unwrap();
-        let mut store = crate::Store::new(manager.notifier().unwrap(), "test", Some(2)).unwrap();
+        let mut store = crate::Store::new(manager.notifier().unwrap(), "test", 2).unwrap();
         let mut restored = store.take_over(&mut passed).unwrap().unwrap();
         let fds: Vec<_> = restored.take_items().map(|item| item.fds.len()).collect();
         assert_eq!(fds, [1, 2]);
@@ -619,31 +624,33 @@ mod tests {
     }
 
     /// The service runs with its file descriptors from 3 on, and the variables that tell of them
-    /// and of the manager.
+    /// and of the manager. `$FDSTORE` is unset for a store that takes no file descriptors.
     #[test]
     fn command() {
         let mut manager = Manager::new().unwrap();
-        manager.set_store_max(4);
         manager.add_socket("first", pipe().1);
         manager.add_socket("second", pipe().1);
         let script = r#"
             test "$LISTEN_PID" = "$$" && test -e /proc/$$/fd/3 && test -e /proc/$$/fd/4 &&
-            echo "$LISTEN_FDS $LISTEN_FDNAMES $FDSTORE $NOTIFY_SOCKET $1"
+            echo "$LISTEN_FDS $LISTEN_FDNAMES ${FDSTORE-unset} $NOTIFY_SOCKET $1"
         "#;
 
-        let output = manager
-            .command("sh")
-            .unwrap()
-            .args(["-c", script, "sh", "arg"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let expected = format!(
-            "2 first:second 4 {} arg\n",
-            manager.notify_socket().display()
-        );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+        for (max, told) in [(4, "4"), (0, "unset")] {
+            manager.set_store_max(max);
+            let output = manager
+                .command("sh")
+                .unwrap()
+                .args(["-c", script, "sh", "arg"])
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let expected = format!(
+                "2 first:second {told} {} arg\n",
+                manager.notify_socket().display()
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+        }
     }
 
     const WAIT: Duration = Duration::from_secs(10);

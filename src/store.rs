@@ -34,8 +34,9 @@ use crate::{
 ///
 /// The unit of the service needs `FileDescriptorStoreMax=` of 2 at least, for systemd to keep a
 /// store, and systemd 254 or later, which tells the service how many file descriptors the store
-/// takes, in `$FDSTORE`. A socket unit has systemd keep the socket that the service listens on,
-/// and the clients that connect meanwhile, while no instance runs.
+/// takes, in `$FDSTORE`. Without them there is no `Store`, as [`from_env`](Self::from_env) tells.
+/// A socket unit has systemd keep the socket that the service listens on, and the clients that
+/// connect meanwhile, while no instance runs.
 ///
 /// # What the store holds
 ///
@@ -61,39 +62,47 @@ use crate::{
 pub struct Store {
     notifier: Notifier,
     key: String,
-    /// How many file descriptors the store takes, `$FDSTORE`.
-    max: Option<usize>,
+    /// How many file descriptors the store takes, `$FDSTORE`: [`MIN_STORE`] at least.
+    max: usize,
     /// The file descriptors kept to give up for those that storing opens.
     reserve: Option<Reserve>,
 }
 
 impl Store {
-    /// The store of the service that `$NOTIFY_SOCKET` names, taking as many file descriptors as
-    /// `$FDSTORE` tells, under `key`, if `$NOTIFY_SOCKET` is set.
+    /// The store that systemd keeps for the service, under `key`.
     ///
-    /// `None` means that systemd didn't start the service, or that the service takes no
-    /// notifications. It fails as [`Notifier::from_env`] and [`Store::new`] do.
-    pub fn from_env(key: &str) -> Result<Option<Self>> {
-        let Some(notifier) = Notifier::from_env()? else {
-            return Ok(None);
-        };
+    /// The service reaches it through the notification socket that `$NOTIFY_SOCKET` names, and it
+    /// takes as many file descriptors as `$FDSTORE` tells. systemd sets both for a service whose
+    /// unit has a `FileDescriptorStoreMax=` above 0, `$FDSTORE` from version 254 on.
+    ///
+    /// It fails with [`Error::NoManager`] if `$NOTIFY_SOCKET` is unset or empty. systemd then
+    /// takes no notifications from the process, as when it doesn't run it at all, and keeps no
+    /// store for it. A service that also runs without systemd goes on without a store then.
+    ///
+    /// It fails with [`Error::NoStore`] if `$FDSTORE` is unset or not a number. systemd then takes
+    /// notifications from the service, as for a unit of `Type=notify`, but keeps no store for it,
+    /// or is older than 254. Otherwise it fails as [`Notifier::from_env`] and [`Store::new`] do.
+    pub fn from_env(key: &str) -> Result<Self> {
+        let notifier = Notifier::from_env()?.ok_or(Error::NoManager)?;
+        let max = fd_store_max().ok_or(Error::NoStore)?;
 
-        Self::new(notifier, key, fd_store_max()).map(Some)
+        Self::new(notifier, key, max)
     }
 
-    /// The store of the service that `notifier` reaches, taking `max` file descriptors, as
-    /// `FileDescriptorStoreMax=` of the unit sets it, under `key`.
+    /// The store of the service that `notifier` reaches, under `key`, which takes `max` file
+    /// descriptors, as `FileDescriptorStoreMax=` of the unit sets it.
     ///
-    /// The key is 1 to 200 printable ASCII characters other than `:` and `/`. For any other key,
-    /// this fails with [`Error::InvalidName`].
-    pub fn new(notifier: Notifier, key: &str, max: Option<usize>) -> Result<Self> {
+    /// It fails with [`Error::StoreTooSmall`] if `max` is less than 2, the fewest that a hand-over
+    /// takes: the memfd and a queue socket. The key is 1 to 200 printable ASCII characters other
+    /// than `:` and `/`. For any other key, this fails with [`Error::InvalidName`].
+    pub fn new(notifier: Notifier, key: &str, max: usize) -> Result<Self> {
         check_key(key)?;
-        let reserve = match max {
-            Some(max) if max >= MIN_STORE => Reserve::new()
-                .inspect_err(|e| warn!("Failed to keep file descriptors to hand over with: {e}"))
-                .ok(),
-            _ => None,
-        };
+        if max < MIN_STORE {
+            return Err(Error::StoreTooSmall { max });
+        }
+        let reserve = Reserve::new()
+            .inspect_err(|e| warn!("Failed to keep file descriptors to hand over with: {e}"))
+            .ok();
 
         Ok(Self {
             notifier,
@@ -107,11 +116,6 @@ impl Store {
     /// ready, among other things.
     pub fn notifier(&self) -> &Notifier {
         &self.notifier
-    }
-
-    /// How many file descriptors the store takes, if systemd keeps one.
-    pub fn max(&self) -> Option<usize> {
-        self.max
     }
 
     /// Take over from the previous instance: take the file descriptors stored under the key out
@@ -206,19 +210,10 @@ impl Store {
     /// [stores](Handover::store) the state of the service and its items once the service stopped
     /// taking requests.
     ///
-    /// It fails if the store can't take a hand-over. The error says why, and which setting of the
-    /// unit to change. It fails with [`Error::NoStore`] if systemd keeps no store for the service.
-    /// It fails with [`Error::StoreTooSmall`] if the store takes fewer than 2 file descriptors, the
-    /// minimum for a hand-over: the memfd and a queue socket. It logs nothing, and the service has
-    /// not stopped taking requests yet. So a service that can't hand over can shut down as it
-    /// would without systemd. Either way, this consumes the store and its
-    /// [notifier](Self::notifier), unless the service cloned the notifier.
-    pub fn handover(self) -> Result<Handover> {
-        match self.max {
-            Some(max) if max >= MIN_STORE => Ok(Handover::new(self)),
-            Some(max) => Err(Error::StoreTooSmall { max }),
-            None => Err(Error::NoStore),
-        }
+    /// This consumes the store and its [notifier](Self::notifier), unless the service cloned the
+    /// notifier.
+    pub fn handover(self) -> Handover {
+        Handover::new(self)
     }
 
     /// Store `state` and `items`, as [`Handover::store`] tells.
@@ -228,8 +223,8 @@ impl Store {
         items: &[(u64, &dyn Save)],
     ) -> Result<Stored> {
         // The store takes the memfd, and as many queue sockets as it has room for besides: one at
-        // least, as `handover` checked.
-        let room = self.max.unwrap_or(MIN_STORE) - 1;
+        // least, as `new` checked.
+        let room = self.max - 1;
         // The file descriptors kept from the start are given up for those that storing opens, each
         // closed before the next opens: the memfd, the two ends of each pair whose one end is a
         // queue socket, and the two ends of the pipe of the barrier.
@@ -439,17 +434,12 @@ fn take_fds(fds: &mut HashMap<u64, OwnedFd>, indexes: Range<u64>) -> Option<Vec<
     taken.into_iter().collect()
 }
 
-/// How many file descriptors the store of the service takes, `$FDSTORE`, if it has one.
+/// How many file descriptors the store of the service takes, `$FDSTORE`, if systemd tells.
 ///
 /// systemd sets it to the `FileDescriptorStoreMax=` of the unit when that isn't 0, from version 254
-/// on. It is `None` if the variable is unset, 0, or not a number.
+/// on. It is `None` if the variable is unset or not a number.
 fn fd_store_max() -> Option<usize> {
-    parse_store_max(env::var("FDSTORE").ok().as_deref())
-}
-
-/// The value of `$FDSTORE`, if it's a number that isn't 0.
-fn parse_store_max(value: Option<&str>) -> Option<usize> {
-    value?.parse().ok().filter(|max| *max > 0)
+    env::var("FDSTORE").ok()?.parse().ok()
 }
 
 /// Check that `key` is one that the names of the store can start with: 1 to [`MAX_KEY_LEN`]

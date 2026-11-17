@@ -32,11 +32,7 @@ fn round_trip() {
     let twice = Item::new(b"", twice);
     let items: [(u64, &dyn Save); 4] = [(1, &bytes), (2, &write_a), (3, &many), (u64::MAX, &twice)];
     let state = Item::new(b"state", vec![write_b]);
-    let stored = store(&manager)
-        .handover()
-        .unwrap()
-        .store(state, items)
-        .unwrap();
+    let stored = store(&manager).handover().store(state, items).unwrap();
     assert_eq!(stored.items(), 4);
     assert_eq!(stored.fds(), 1 + 1 + MAX_FDS + 10 + 2);
     assert_eq!(manager.stored_names(), ["test/state", "test/fds"]);
@@ -138,7 +134,7 @@ fn unsaved_items_fail_the_hand_over() {
             (2, unsaved),
             (3, Box::new(Item::new(b"three", vec![pipe().1]))),
         ];
-        let handover = store(&manager).handover().unwrap();
+        let handover = store(&manager).handover();
         let error = handover.store(&[][..], items).unwrap_err();
         let Error::Unsaved {
             item: Some(2),
@@ -165,11 +161,7 @@ fn missing_fds_fail_the_take_over() {
         (2, Item::new(b"two", vec![pipe().1, pipe().1])),
         (3, Item::new(b"three", vec![pipe().1])),
     ];
-    store(&manager)
-        .handover()
-        .unwrap()
-        .store(&[][..], items)
-        .unwrap();
+    store(&manager).handover().store(&[][..], items).unwrap();
 
     // The second file descriptor, the first of the second item, goes missing.
     let mut stored = manager.stored().unwrap();
@@ -209,11 +201,7 @@ fn take_over_over_the_fd_limit() {
         .take(32)
         .collect();
     let items = [(1, Item::new(b"many", fds))];
-    store(&manager)
-        .handover()
-        .unwrap()
-        .store(&[][..], items)
-        .unwrap();
+    store(&manager).handover().store(&[][..], items).unwrap();
     let mut passed = manager.passed().unwrap();
     let mut store = store(&manager);
     // Room for a few file descriptors more than are open, which the manager adds to as it closes
@@ -238,7 +226,7 @@ fn unsaved_state() {
         (Box::new(Failing(pipe().1)), true),
     ] {
         let manager = Manager::new().unwrap();
-        let handover = store(&manager).handover().unwrap();
+        let handover = store(&manager).handover();
         let error = handover.store(state, NO_ITEMS).unwrap_err();
         let Error::Unsaved { item: None, source } = &error else {
             panic!("{error:?}");
@@ -247,24 +235,23 @@ fn unsaved_state() {
     }
 }
 
-/// A store that takes no hand-over, as one without `$FDSTORE` or of fewer than 2 file descriptors,
-/// starts none.
+/// A store that takes fewer than 2 file descriptors can't hold a hand-over, so creating it fails.
+/// The error names the unit setting to raise.
 #[test]
-fn no_hand_over_without_room() {
+fn no_store_without_room() {
     let manager = Manager::new().unwrap();
-    for max in [None, Some(0), Some(1)] {
-        let store = Store::new(manager.notifier().unwrap(), KEY, max).unwrap();
-        let error = store.handover().unwrap_err();
-        match (max, &error) {
-            (None, Error::NoStore) => (),
-            (Some(max), Error::StoreTooSmall { max: too_few }) => assert_eq!(*too_few, max),
-            _ => panic!("{max:?}: {error:?}"),
-        }
+    for max in [0, 1] {
+        let error = Store::new(manager.notifier().unwrap(), KEY, max).unwrap_err();
+        assert!(
+            matches!(error, Error::StoreTooSmall { max: too_few } if too_few == max),
+            "{max}: {error:?}"
+        );
         assert!(
             error.to_string().contains("`FileDescriptorStoreMax=`"),
             "{error}"
         );
     }
+    Store::new(manager.notifier().unwrap(), KEY, MIN_STORE).unwrap();
 }
 
 /// A hand-over starts before the service has what it hands over, which it hands over borrowed, as
@@ -272,7 +259,7 @@ fn no_hand_over_without_room() {
 #[test]
 fn items_made_once_started() {
     let manager = Manager::new().unwrap();
-    let handover = store(&manager).handover().unwrap();
+    let handover = store(&manager).handover();
     let clients = [(4, pipe().1), (2, pipe().1)];
     let state = b"state".to_vec();
     let items = clients.iter().map(|(id, client)| (*id, client));
@@ -296,11 +283,11 @@ fn keys() {
     let manager = Manager::new().unwrap();
     let longest = "a".repeat(MAX_KEY_LEN);
     for key in ["busd", "with spaces", "a.b-c_d", &longest] {
-        Store::new(manager.notifier().unwrap(), key, Some(2)).unwrap();
+        Store::new(manager.notifier().unwrap(), key, 2).unwrap();
     }
     let too_long = "a".repeat(MAX_KEY_LEN + 1);
     for key in ["", "a/b", "a:b", "a\nb", "é", &too_long] {
-        let error = Store::new(manager.notifier().unwrap(), key, Some(2)).unwrap_err();
+        let error = Store::new(manager.notifier().unwrap(), key, 2).unwrap_err();
         assert!(matches!(error, Error::InvalidName(_)), "{key:?}: {error:?}");
     }
 }
@@ -398,38 +385,73 @@ fn items_take_their_fds() {
 }
 
 #[test]
-fn store_max() {
-    assert_eq!(parse_store_max(Some("16")), Some(16));
-    assert_eq!(parse_store_max(Some("1")), Some(1));
-    assert_eq!(parse_store_max(None), None);
-    for value in ["", "0", "-1", "x", "1.5", " 1", "99999999999999999999"] {
-        assert_eq!(parse_store_max(Some(value)), None, "$FDSTORE={value:?}");
-    }
-}
-
-#[test]
 fn from_the_environment() {
     let exports = "NOTIFY_SOCKET=/run/systemd/notify FDSTORE=16";
     if !in_own_process("store::tests::from_the_environment", exports) {
         return;
     }
 
-    let store = Store::from_env(KEY).unwrap().unwrap();
-    assert_eq!(store.max(), Some(16));
-    // SAFETY: The test runs in a process of its own, which has no other thread that reads or
-    // writes the environment. So do the ones below.
-    unsafe { env::remove_var("FDSTORE") };
-    let store = Store::from_env(KEY).unwrap().unwrap();
-    assert_eq!(store.max(), None);
+    let store = Store::from_env(KEY).unwrap();
+    assert_eq!(store.max, 16);
+    // A number that `$FDSTORE` tells is judged as one that `Store::new` is given: a hand-over
+    // doesn't fit in a store that takes fewer than 2 file descriptors.
+    for max in [0, 1] {
+        // SAFETY: The test runs in a process of its own, which has no other thread that reads or
+        // writes the environment. So do the ones below.
+        unsafe { env::set_var("FDSTORE", max.to_string()) };
+        let error = Store::from_env(KEY).unwrap_err();
+        assert!(
+            matches!(error, Error::StoreTooSmall { max: too_few } if too_few == max),
+            "{max}: {error:?}"
+        );
+    }
+    // Without a number in `$FDSTORE`, systemd keeps no store for the service that it takes
+    // notifications from, and the error names the unit setting that has it keep one.
+    for value in ["", "-1", "x", "1.5", " 1", "99999999999999999999"] {
+        // SAFETY: As above.
+        unsafe { env::set_var("FDSTORE", value) };
+        let error = Store::from_env(KEY).unwrap_err();
+        assert!(
+            matches!(error, Error::NoStore),
+            "$FDSTORE={value:?}: {error:?}"
+        );
+    }
     // SAFETY: As above.
-    unsafe { env::remove_var("NOTIFY_SOCKET") };
-    assert!(Store::from_env(KEY).unwrap().is_none());
+    unsafe { env::remove_var("FDSTORE") };
+    let error = Store::from_env(KEY).unwrap_err();
+    assert!(matches!(error, Error::NoStore), "{error:?}");
+    assert!(
+        error.to_string().contains("`FileDescriptorStoreMax=`"),
+        "{error}"
+    );
+    // Without a notification socket, systemd takes no notifications from the process, as when it
+    // doesn't run it at all, which is an error of its own, whatever `$FDSTORE` tells.
+    for fd_store in [None, Some("16")] {
+        for socket in [Some(""), None] {
+            // SAFETY: As above.
+            unsafe {
+                match fd_store {
+                    Some(fd_store) => env::set_var("FDSTORE", fd_store),
+                    None => env::remove_var("FDSTORE"),
+                }
+                match socket {
+                    Some(socket) => env::set_var("NOTIFY_SOCKET", socket),
+                    None => env::remove_var("NOTIFY_SOCKET"),
+                }
+            }
+            let error = Store::from_env(KEY).unwrap_err();
+            assert!(
+                matches!(error, Error::NoManager),
+                "$NOTIFY_SOCKET={socket:?} $FDSTORE={fd_store:?}: {error:?}"
+            );
+        }
+    }
 }
 
 /// A store of the manager, under `KEY`, that takes as many file descriptors as the store of the
 /// manager does.
 fn store(manager: &Manager) -> Store {
-    Store::new(manager.notifier().unwrap(), KEY, Some(manager.store_max())).unwrap()
+    Store::new(manager.notifier().unwrap(), KEY, manager.store_max()).unwrap()
 }
 
 /// What the manager passes the next instance, taken over.

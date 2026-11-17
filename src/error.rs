@@ -42,22 +42,29 @@ pub enum Error {
     /// allowed characters. Converted into an [`io::Error`], it has the kind
     /// [`io::ErrorKind::InvalidInput`].
     InvalidName(String),
+    /// No service manager takes notifications from the process.
+    ///
+    /// [`Store::from_env`](crate::Store::from_env) fails with it if `$NOTIFY_SOCKET` is unset or
+    /// empty. systemd sets it for a service whose unit is of `Type=notify` or has a
+    /// `FileDescriptorStoreMax=` above 0, among others. So this is the error of a process that
+    /// systemd doesn't run, and of a service whose unit has neither. Such a process has no store
+    /// to restart through. Converted into an [`io::Error`], it has the kind
+    /// [`io::ErrorKind::Unsupported`].
+    NoManager,
     /// systemd keeps no file descriptor store for the service.
     ///
-    /// With [`Store::from_env`](crate::Store::from_env), this means that `$FDSTORE` is unset, `0`,
-    /// or not a number. With [`Store::new`](crate::Store::new), it means that `max` is `None`.
-    /// [`Store::handover`](crate::Store::handover) fails with this error before the service stops
-    /// taking requests, so that the service can shut down normally instead. systemd 254 or later
-    /// sets `$FDSTORE` to the service's `FileDescriptorStoreMax=`, unless that is 0. Converted into
-    /// an [`io::Error`], it has the kind [`io::ErrorKind::Unsupported`].
+    /// [`Store::from_env`](crate::Store::from_env) fails with it if `$FDSTORE` is unset or not a
+    /// number, for a service that systemd takes notifications from. systemd sets `$FDSTORE` for a
+    /// service whose unit has a `FileDescriptorStoreMax=` above 0, from version 254 on. Converted
+    /// into an [`io::Error`], it has the kind [`io::ErrorKind::Unsupported`].
     NoStore,
     /// The store takes fewer file descriptors than any hand-over needs.
     ///
-    /// [`Store::handover`](crate::Store::handover) fails with it, like [`NoStore`](Self::NoStore),
-    /// before the service stops taking requests. The service's `FileDescriptorStoreMax=` raises the
-    /// number. Converted into an [`io::Error`], it has the kind [`io::ErrorKind::Unsupported`].
+    /// [`Store::from_env`](crate::Store::from_env) and [`Store::new`](crate::Store::new) fail with
+    /// it. The service's `FileDescriptorStoreMax=` raises the number. Converted into an
+    /// [`io::Error`], it has the kind [`io::ErrorKind::Unsupported`].
     StoreTooSmall {
-        /// The number of file descriptors that the store takes, from `$FDSTORE`.
+        /// The number of file descriptors that the store takes.
         max: usize,
     },
     /// The store has no room for the file descriptors of this hand-over.
@@ -121,11 +128,16 @@ impl fmt::Display for Error {
             | Self::InvalidName(message)
             | Self::InvalidHandover(message)
             | Self::UnsupportedHandover(message) => f.write_str(message),
+            Self::NoManager => f.write_str(
+                "no service manager takes notifications from the process, as `$NOTIFY_SOCKET` is \
+                 unset or empty: systemd doesn't run it as a service, or its unit has neither \
+                 `Type=notify` nor `FileDescriptorStoreMax=`",
+            ),
             Self::NoStore => write!(
                 f,
-                "systemd keeps no file descriptor store for the service, as `$FDSTORE` isn't set: \
-                 set `FileDescriptorStoreMax=` of the service to {MIN_STORE} at least, under \
-                 systemd 254 or later"
+                "systemd keeps no file descriptor store for the service, as `$FDSTORE` is unset \
+                 or not a number: set `FileDescriptorStoreMax=` of the service to {MIN_STORE} at \
+                 least, under systemd 254 or later"
             ),
             Self::StoreTooSmall { max } => write!(
                 f,
@@ -181,9 +193,10 @@ impl From<Error> for io::Error {
             Error::Io(e) => return e,
             Error::Environment(_) | Error::InvalidHandover(_) => io::ErrorKind::InvalidData,
             Error::InvalidName(_) | Error::Unsaved { .. } => io::ErrorKind::InvalidInput,
-            Error::NoStore | Error::StoreTooSmall { .. } | Error::UnsupportedHandover(_) => {
-                io::ErrorKind::Unsupported
-            }
+            Error::NoManager
+            | Error::NoStore
+            | Error::StoreTooSmall { .. }
+            | Error::UnsupportedHandover(_) => io::ErrorKind::Unsupported,
             Error::StoreFull => io::ErrorKind::StorageFull,
             Error::TimedOut => io::ErrorKind::TimedOut,
         };
@@ -215,6 +228,7 @@ mod tests {
                 Error::InvalidName("name".to_owned()),
                 io::ErrorKind::InvalidInput,
             ),
+            (Error::NoManager, io::ErrorKind::Unsupported),
             (Error::NoStore, io::ErrorKind::Unsupported),
             (Error::StoreTooSmall { max: 1 }, io::ErrorKind::Unsupported),
             (Error::StoreFull, io::ErrorKind::StorageFull),
