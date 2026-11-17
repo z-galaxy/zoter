@@ -120,6 +120,39 @@ fn no_take_over_of_garbage() {
     assert_eq!(names, ["other/state"]);
 }
 
+/// Taking over tells the manager that the service has started, after it removed what it took
+/// from the store: with a hand-over, with none, and with one that it fails to take over.
+#[test]
+fn taking_over_tells_that_the_service_started() {
+    let manager = Manager::new().unwrap();
+    let mut passed = manager.passed().unwrap();
+    let mut first = store(&manager);
+    assert!(first.take_over(&mut passed).unwrap().is_none());
+    first.notifier().barrier(WAIT).unwrap();
+    assert_eq!(manager.take_notifications(), ["READY=1", "BARRIER=1"]);
+
+    first.hand_over(b"state".to_vec(), NO_ITEMS).unwrap();
+    manager.take_notifications();
+    let garbage = memfd::sealed("test", b"not a hand-over").unwrap();
+    for taken_over in [true, false] {
+        if !taken_over {
+            manager.replace_store(vec![(
+                "test/state".to_owned(),
+                garbage.try_clone().unwrap(),
+            )]);
+        }
+        let mut passed = manager.passed().unwrap();
+        let mut next = store(&manager);
+        assert_eq!(next.take_over(&mut passed).is_ok(), taken_over);
+        next.notifier().barrier(WAIT).unwrap();
+        assert_eq!(
+            manager.take_notifications(),
+            ["FDSTOREREMOVE=1\nFDNAME=test/state", "READY=1", "BARRIER=1"],
+            "taken over: {taken_over}"
+        );
+    }
+}
+
 /// An item that can't be saved, as one whose record fails to be saved, fails the hand-over, naming
 /// the item, and nothing is stored.
 #[test]

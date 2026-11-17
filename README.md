@@ -33,13 +33,14 @@ D-Bus or Varlink:
 
 * [`Passed`] takes the file descriptors that systemd passes a service: the sockets of socket
   activation, and what the previous instance stored.
-* [`Notifier`] tells systemd that the service is ready, among other things, and stores file
-  descriptors in its store.
+* [`Notifier`] is the notification socket of systemd, which stores file descriptors in the store
+  of the service, among other things.
 * [`Store`] hands the service over to its next instance. In the instance that stops,
   [`Store::hand_over`] stores the state of the service and items, such as the connections of its
   clients, each a record of bytes and file descriptors, however many there are. In the next
-  instance, [`Store::take_over`] takes them over, as a [`Restored`]. A hand-over is stored whole
-  and taken over whole, or either fails: nothing of it is left out.
+  instance, [`Store::take_over`] takes them over, as a [`Restored`], and tells systemd that the
+  service has started. A hand-over is stored whole and taken over whole, or either fails: nothing
+  of it is left out.
 
 A protocol takes part through two traits, [`Save`] and [`Restore`], which the hand-overs of its
 connections implement, so that a service hands those over as they are. The `testing` feature adds
@@ -73,7 +74,8 @@ fn main() -> zoter::Result<()> {
         Err(e) => return Err(e),
     };
     // The file descriptors stored under `example/` are taken out of `passed`, and removed from the
-    // store, and the hand-over that they hold is read, if there is one.
+    // store, and the hand-over that they hold is read, if there is one. systemd takes the service
+    // for started from here on.
     let restored = store.take_over(&mut passed)?;
     // What is left in `passed` is the sockets of socket activation, by the names of their units.
     let _listener = passed.take("example.socket");
@@ -86,7 +88,6 @@ fn main() -> zoter::Result<()> {
             clients.push((id, item.restore()?));
         }
     }
-    store.notifier().notify("READY=1")?;
 
     // Serve the clients, and the ones that connect, until systemd sends `SIGTERM`.
 
@@ -112,6 +113,7 @@ WantedBy=sockets.target
 ```ini
 # example.service
 [Service]
+# The service has started once it took over, which zoter tells systemd.
 Type=notify
 ExecStart=/usr/bin/example
 # The memfd of the hand-over, and the sockets that hold its file descriptors, some 70000 in each.

@@ -79,9 +79,10 @@ benches/handover.rs # [testing feature] What storing a hand-over and taking it o
 `Store::hand_over` lays a hand-over out in one memfd, stored under `<key>/state`, and puts the FDs
 of the state and of the items in the queues of sockets, stored under `<key>/fds`, as many as that
 takes. `Store::take_over` takes the names of its key out of `Passed`, removes them from the store
-first, maps the memfd, and takes the FDs out of the queues by their indexes. The tests that take
-FDs from 3 on, change the environment or the limit of open FDs, or fork children that don't exec,
-run in a process of their own (`test_utils::in_own_process`).
+first, maps the memfd, and takes the FDs out of the queues by their indexes. Then it tells systemd
+that the service has started (`READY=1`), whatever came of that, so that no service has to. The
+tests that take FDs from 3 on, change the environment or the limit of open FDs, or fork children
+that don't exec, run in a process of their own (`test_utils::in_own_process`).
 
 ## Development Guidelines
 

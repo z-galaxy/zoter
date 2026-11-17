@@ -90,7 +90,7 @@ async fn serve(mut passed: zoter::Passed) -> zoter::Result<()> {
         Err(e) => return Err(e),
     };
     // Takes the FDs stored under `example/` out of `passed`, removes them from the store, and
-    // reads the hand-over that they hold, if any.
+    // reads the hand-over that they hold, if any. Tells systemd that the service has started.
     let restored = store.take_over(&mut passed)?;
     // What is left in `passed` is the sockets of socket activation, by the names of their units.
     let listener = passed.take("example.socket");
@@ -107,7 +107,6 @@ async fn serve(mut passed: zoter::Passed) -> zoter::Result<()> {
         }
         None => Server::new(listener),
     };
-    store.notifier().notify("READY=1")?;
 
     sigterm.await;
     // The service's own async work: stop taking requests, finish those it took, and take each
@@ -242,7 +241,7 @@ impl Store {
     /// remove them from the store, and read the whole hand-over that they hold, if any. It fails
     /// with `Error::Io` of `EMFILE` if the FDs don't fit under the process's soft limit of open
     /// FDs. It fails with `Error::InvalidHandover` if FDs of the state or of an item are missing
-    /// for another reason.
+    /// for another reason. Whatever comes of it, it tells systemd that the service has started.
     pub fn take_over(&mut self, passed: &mut Passed) -> zoter::Result<Option<Restored>>;
     /// Hand over to the next instance: store `state`, and `items`, each under an id that the crate
     /// doesn't look at, so that the state can refer to it, for the next instance, and wait for
@@ -423,6 +422,8 @@ Taking over:
 - FDs of the state or of an item that are missing for another reason: `Error::InvalidHandover`.
   Every FD of the hand-over is closed.
 - FDs that no item has: closed.
+- systemd can't be told that the service has started: a warning. The service keeps what it took
+  over.
 
 Handing over:
 
@@ -569,6 +570,12 @@ restarts. It is free on crates.io, and its repository is `z-galaxy/zoter`.
    `Store::handover` start a `Handover`, before the service stopped serving, so that the service
    found out first if it couldn't hand over. Creating the `Store` tells that now, which left
    `Handover` nothing to do, so it went.
+10. `Store::take_over` tells systemd that the service has started (`READY=1`), whatever comes of
+    the take-over, so that a service tells systemd nothing itself. The first version left that to
+    the service, through the notifier of its store. Taking over comes before the service serves,
+    which socket activation makes up for: the clients wait in sockets that systemd keeps. A
+    service that binds a socket of its own after it took over has started, for systemd, a moment
+    before it listens.
 
 ## The plan
 

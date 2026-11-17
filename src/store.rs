@@ -141,7 +141,64 @@ impl Store {
     /// [`Error::UnsupportedHandover`] for a hand-over that a later version of zoter laid out. On
     /// failure, the file descriptors of the hand-over are closed, which disconnects the peers of
     /// the items.
+    ///
+    /// Taking over also tells systemd that the service has started, which a unit of `Type=notify`
+    /// waits for. It does so whatever comes of the take-over: with nothing handed over, or with a
+    /// hand-over that fails to be taken over, the service starts afresh. So a service takes over
+    /// each time it starts, and tells systemd nothing of its start itself. Its clients wait for
+    /// it meanwhile in the sockets of socket activation, which systemd keeps, and in those that
+    /// it takes over. A failure to tell systemd only logs a warning.
     pub fn take_over(&mut self, passed: &mut Passed) -> Result<Option<Restored>> {
+        let restored = self.take_handover(passed);
+        // With the hand-over or without it, the service goes on from here, so it has started.
+        if let Err(e) = self.notifier.notify("READY=1") {
+            warn!("Failed to tell systemd that the service has started: {e}");
+        }
+
+        restored
+    }
+
+    /// Hand over to the next instance: store `state`, the state of the service, and `items`, in
+    /// their order, each under its id, for the next instance, and wait for systemd to have dealt
+    /// with them.
+    ///
+    /// The service does this once it stopped taking requests. This consumes the store and its
+    /// [notifier](Self::notifier), unless the service cloned the notifier.
+    ///
+    /// The state of a service that has none is `&[][..]`. zoter doesn't look at the ids, nor
+    /// checks that they are unique: it gives each back with its item, for the state to refer to
+    /// the item by. The items are of any type, borrowed or owned, those of different types as
+    /// `&dyn Save` or `Box<dyn Save>`.
+    ///
+    /// Either the whole hand-over is stored, or this fails: no part of it is left out. It fails
+    /// with [`Error::Unsaved`] if the state or an item can't be saved, or if saving its record
+    /// fails. The error names the id of the item, and nothing is stored. It fails with
+    /// [`Error::StoreFull`] if the file descriptors don't fit in the store. The service's
+    /// `FileDescriptorStoreMax=` makes the store hold more. It fails with [`Error::Io`] for any I/O
+    /// error while storing the memfd or the file descriptors, or while queueing them for the
+    /// store. It fails with [`Error::TimedOut`] if systemd takes longer than 5 s to process what
+    /// was stored. A hand-over that fails after the memfd was stored may leave part of itself in
+    /// the store. The next instance fails to take that part over, and removes it from the store
+    /// like any other hand-over.
+    pub fn hand_over<S, I, T>(self, state: S, items: I) -> Result<Stored>
+    where
+        S: Save,
+        I: IntoIterator<Item = (u64, T)>,
+        T: Save,
+    {
+        let items: Vec<_> = items.into_iter().collect();
+        // The rest takes no generics, so that it is built once, whatever the types.
+        let items: Vec<_> = items
+            .iter()
+            .map(|(id, item)| (*id, item as &dyn Save))
+            .collect();
+
+        self.store_all(&state, &items)
+    }
+
+    /// What the previous instance handed over, out of `passed`, as
+    /// [`take_over`](Self::take_over) tells.
+    fn take_handover(&self, passed: &mut Passed) -> Result<Option<Restored>> {
         let prefix = format!("{}/", self.key);
         let stored = passed.take_prefixed(&prefix);
         // More than one file descriptor may come under a name, as the queue sockets do.
@@ -206,44 +263,6 @@ impl Store {
             state_fds,
             items,
         }))
-    }
-
-    /// Hand over to the next instance: store `state`, the state of the service, and `items`, in
-    /// their order, each under its id, for the next instance, and wait for systemd to have dealt
-    /// with them.
-    ///
-    /// The service does this once it stopped taking requests. This consumes the store and its
-    /// [notifier](Self::notifier), unless the service cloned the notifier.
-    ///
-    /// The state of a service that has none is `&[][..]`. zoter doesn't look at the ids, nor
-    /// checks that they are unique: it gives each back with its item, for the state to refer to
-    /// the item by. The items are of any type, borrowed or owned, those of different types as
-    /// `&dyn Save` or `Box<dyn Save>`.
-    ///
-    /// Either the whole hand-over is stored, or this fails: no part of it is left out. It fails
-    /// with [`Error::Unsaved`] if the state or an item can't be saved, or if saving its record
-    /// fails. The error names the id of the item, and nothing is stored. It fails with
-    /// [`Error::StoreFull`] if the file descriptors don't fit in the store. The service's
-    /// `FileDescriptorStoreMax=` makes the store hold more. It fails with [`Error::Io`] for any I/O
-    /// error while storing the memfd or the file descriptors, or while queueing them for the
-    /// store. It fails with [`Error::TimedOut`] if systemd takes longer than 5 s to process what
-    /// was stored. A hand-over that fails after the memfd was stored may leave part of itself in
-    /// the store. The next instance fails to take that part over, and removes it from the store
-    /// like any other hand-over.
-    pub fn hand_over<S, I, T>(self, state: S, items: I) -> Result<Stored>
-    where
-        S: Save,
-        I: IntoIterator<Item = (u64, T)>,
-        T: Save,
-    {
-        let items: Vec<_> = items.into_iter().collect();
-        // The rest takes no generics, so that it is built once, whatever the types.
-        let items: Vec<_> = items
-            .iter()
-            .map(|(id, item)| (*id, item as &dyn Save))
-            .collect();
-
-        self.store_all(&state, &items)
     }
 
     /// Store `state` and `items`, as [`hand_over`](Self::hand_over) tells.

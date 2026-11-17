@@ -72,15 +72,8 @@ fn serve() {
 
             (count, UnixStream::from(item.restore::<OwnedFd>().unwrap()))
         }
-        None => {
-            store.notifier().notify("READY=1").unwrap();
-
-            (0, listener.accept().unwrap().0)
-        }
+        None => (0, listener.accept().unwrap().0),
     };
-    if count > 0 {
-        store.notifier().notify("READY=1").unwrap();
-    }
 
     let mut request = String::new();
     BufReader::new(&client).read_line(&mut request).unwrap();
