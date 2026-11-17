@@ -37,7 +37,10 @@ mod linux {
     };
 
     use criterion::{Criterion, criterion_group};
-    use zoter::{Restore, Save, Store, Stored, testing::Manager};
+    use zoter::{
+        Restore, Save, Store, Stored,
+        testing::{self, Manager},
+    };
 
     criterion_group!(benches, stores, take_overs);
 
@@ -138,8 +141,7 @@ mod linux {
             assert_eq!(connections.len(), self.connections.len());
             // The manager removes what was taken over from its store before the next round stores
             // into it, as it keeps no more than its store takes.
-            store
-                .notifier()
+            self.manager
                 .barrier(WAIT)
                 .expect("the manager removes what was taken over");
 
@@ -148,9 +150,8 @@ mod linux {
 
         /// The store of an instance of the service, as the instance creates it as it starts.
         fn store(&self) -> Store {
-            let notifier = self.manager.notifier().expect("a notifier of the manager");
-
-            Store::new(notifier, KEY, self.manager.store_max()).expect("a store")
+            testing::store(self.manager.notify_socket(), KEY, self.manager.store_max())
+                .expect("a store")
         }
 
         /// The items of a hand-over of the service: its connections, under the numbers of their

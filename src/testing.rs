@@ -1,4 +1,5 @@
-//! A fake service manager, for the tests of the restarts of services: [`Manager`].
+//! What the tests of the restarts of services need: [`Manager`], a fake service manager, and
+//! [`store`], the store of a service that a test runs in its own process.
 //!
 //! This is behind the `testing` cargo feature.
 
@@ -31,8 +32,8 @@ use rustix::{
 };
 
 use crate::{
-    Error, Notifier, Passed, Result,
-    notifier::MAX_FDS,
+    Error, Passed, Result, Store,
+    notifier::{MAX_FDS, Notifier},
     passed::START,
     queue::{self, Queue},
 };
@@ -51,8 +52,9 @@ use crate::{
 /// [`command`](Self::command) starts a service as systemd starts one, with the sockets of socket
 /// activation that the test gives the manager ([`add_socket`](Self::add_socket)) and what is in
 /// the store, so that a test restarts a service by stopping it and starting it again. For a
-/// service that runs in the test process, [`notifier`](Self::notifier) and
-/// [`passed`](Self::passed) give what [`Notifier::from_env`] and [`Passed::from_env`] would.
+/// service that runs in the test process, [`store`] gives the store that [`Store::from_env`] would,
+/// out of [`notify_socket`](Self::notify_socket) and [`store_max`](Self::store_max), and
+/// [`passed`](Self::passed) gives what [`Passed::from_env`] would.
 pub struct Manager {
     /// The path of the notification socket.
     path: PathBuf,
@@ -102,12 +104,6 @@ impl Manager {
     /// The path of the notification socket, as `$NOTIFY_SOCKET` names it.
     pub fn notify_socket(&self) -> &Path {
         &self.path
-    }
-
-    /// A notifier of this manager, as [`Notifier::from_env`] gives one to the services that it
-    /// starts.
-    pub fn notifier(&self) -> Result<Notifier> {
-        Notifier::new(&self.path)
     }
 
     /// Have the store take `max` file descriptors, as `FileDescriptorStoreMax=` has systemd do.
@@ -260,12 +256,23 @@ impl Manager {
         }
     }
 
+    /// Wait, `timeout` at most, for the manager to have dealt with what the services sent it so
+    /// far.
+    ///
+    /// The manager deals with what it gets on a thread of its own, in the order that it came. So
+    /// what a service stored, removed or told it just before may not show yet, as in
+    /// [`stored_names`](Self::stored_names). This sends the manager a barrier of the test's own,
+    /// which shows among the notifications as `BARRIER=1`, and waits for the manager to get to
+    /// it. It fails with [`Error::TimedOut`] if the manager takes longer than `timeout`.
+    pub fn barrier(&self, timeout: Duration) -> Result<()> {
+        Notifier::new(&self.path)?.barrier(timeout)
+    }
+
     /// The text of each notification that came and that [`wait_for`](Self::wait_for) didn't let
     /// go of, oldest first, to wait for none of them again.
     ///
     /// The manager deals with the notifications on a thread of its own, so a notification sent
-    /// just before this may not be among them: a [`Notifier::barrier`] of the test is dealt with
-    /// once those that came before it are.
+    /// just before this may not be among them: [`barrier`](Self::barrier) waits for those.
     pub fn take_notifications(&self) -> Vec<String> {
         self.shared.state().notifications.drain(..).collect()
     }
@@ -356,6 +363,19 @@ impl Drop for Manager {
         }
         let _ = remove_file(&self.path);
     }
+}
+
+/// The store of a service whose manager takes notifications at `notify_socket`, under `key`,
+/// which takes `max` file descriptors: the one that [`Store::from_env`] gives a service whose
+/// `$NOTIFY_SOCKET` is `notify_socket` and whose `$FDSTORE` is `max`.
+///
+/// It is for a service that a test runs in its own process, where the environment tells nothing
+/// of the manager. The test gives it the [`notify_socket`](Manager::notify_socket) and the
+/// [`store_max`](Manager::store_max) of a [`Manager`], or those of a manager that it plays itself.
+///
+/// It fails as [`Store::from_env`] does for such a `$NOTIFY_SOCKET`, `$FDSTORE` and key.
+pub fn store(notify_socket: impl AsRef<OsStr>, key: &str, max: usize) -> Result<Store> {
+    Store::with_notifier(Notifier::new(notify_socket)?, key, max)
 }
 
 /// What the thread that serves the notification socket shares with the manager.
@@ -514,7 +534,7 @@ mod tests {
     #[test]
     fn store_and_remove() {
         let manager = Manager::new().unwrap();
-        let notifier = manager.notifier().unwrap();
+        let notifier = Notifier::new(manager.notify_socket()).unwrap();
         let (read, write_end) = pipe();
 
         notifier.store("a", &[write_end.as_fd()]).unwrap();
@@ -541,7 +561,7 @@ mod tests {
     fn store_takes_its_max() {
         let mut manager = Manager::new().unwrap();
         manager.set_store_max(2);
-        let notifier = manager.notifier().unwrap();
+        let notifier = Notifier::new(manager.notify_socket()).unwrap();
         let fds: Vec<_> = (0..3).map(|_| pipe().1).collect();
         let borrowed: Vec<_> = fds.iter().map(AsFd::as_fd).collect();
 
@@ -553,7 +573,7 @@ mod tests {
     #[test]
     fn wait_for_notifications() {
         let manager = Manager::new().unwrap();
-        let notifier = manager.notifier().unwrap();
+        let notifier = Notifier::new(manager.notify_socket()).unwrap();
 
         notifier.notify("STATUS=Starting").unwrap();
         notifier.notify("READY=1\nSTATUS=Up").unwrap();
@@ -568,7 +588,7 @@ mod tests {
         );
 
         notifier.notify("STATUS=Down").unwrap();
-        notifier.barrier(WAIT).unwrap();
+        manager.barrier(WAIT).unwrap();
         assert_eq!(manager.take_notifications(), ["STATUS=Down", "BARRIER=1"]);
         assert!(manager.take_notifications().is_empty());
     }
@@ -576,7 +596,7 @@ mod tests {
     #[test]
     fn passed_as_systemd_passes_them() {
         let mut manager = Manager::new().unwrap();
-        let notifier = manager.notifier().unwrap();
+        let notifier = Notifier::new(manager.notify_socket()).unwrap();
         manager.add_socket("example.socket", pipe().1);
         notifier.store("stored", &[pipe().1.as_fd()]).unwrap();
         notifier.barrier(WAIT).unwrap();
@@ -592,7 +612,7 @@ mod tests {
     #[test]
     fn stored_fds() {
         let manager = Manager::new().unwrap();
-        let store = crate::Store::new(manager.notifier().unwrap(), "test", 2).unwrap();
+        let store = super::store(manager.notify_socket(), "test", 2).unwrap();
         let items = [(1, Fds(vec![pipe().1])), (2, Fds(vec![pipe().1, pipe().1]))];
         store.hand_over(&[][..], items).unwrap();
 
@@ -600,7 +620,7 @@ mod tests {
         assert_eq!(manager.stored_fds("test").unwrap(), 3);
         assert_eq!(manager.stored_fds("other").unwrap(), 0);
         let mut passed = manager.passed().unwrap();
-        let mut store = crate::Store::new(manager.notifier().unwrap(), "test", 2).unwrap();
+        let mut store = super::store(manager.notify_socket(), "test", 2).unwrap();
         let mut restored = store.take_over(&mut passed).unwrap().unwrap();
         let fds: Vec<_> = restored.take_items().map(|item| item.fds.len()).collect();
         assert_eq!(fds, [1, 2]);

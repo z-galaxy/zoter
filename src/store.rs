@@ -15,10 +15,10 @@ use rustix::{
 };
 
 use crate::{
-    Error, Notifier, Passed, Restored, Result, Save,
+    Error, Passed, Restored, Result, Save,
     layout::{self, Entry, Layout},
     memfd,
-    notifier::MAX_FDS,
+    notifier::{MAX_FDS, Notifier},
     queue::{self, Queue},
     restored::Slot,
 };
@@ -77,47 +77,30 @@ impl Store {
     /// takes as many file descriptors as `$FDSTORE` tells. systemd sets both for a service whose
     /// unit has a `FileDescriptorStoreMax=` above 0, `$FDSTORE` from version 254 on.
     ///
+    /// The key is 1 to 200 printable ASCII characters other than `:` and `/`. For any other key,
+    /// this fails with [`Error::InvalidName`].
+    ///
     /// It fails with [`Error::NoManager`] if `$NOTIFY_SOCKET` is unset or empty. systemd then
     /// takes no notifications from the process, as when it doesn't run it at all, and keeps no
     /// store for it. A service that also runs without systemd goes on without a store then.
     ///
     /// It fails with [`Error::NoStore`] if `$FDSTORE` is unset or not a number. systemd then takes
     /// notifications from the service, as for a unit of `Type=notify`, but keeps no store for it,
-    /// or is older than 254. Otherwise it fails as [`Notifier::from_env`] and [`Store::new`] do.
+    /// or is older than 254. It fails with [`Error::StoreTooSmall`] if `$FDSTORE` is less than 2,
+    /// the fewest that a hand-over takes: the memfd and a queue socket.
+    ///
+    /// `$NOTIFY_SOCKET` is the path of a socket if it starts with a `/`, and the name of an
+    /// abstract socket, after the `@`, if it starts with one. A `/` or an `@` alone names nothing,
+    /// and fails with [`Error::Environment`]. systemd also has `vsock:` addresses, which a virtual
+    /// machine uses to tell its host that it has booted. zoter doesn't support them: they fail
+    /// with [`Error::Environment`] too, like any other address that is neither a path nor an
+    /// abstract name. A name too long for a socket address fails with [`Error::Io`] of
+    /// `ENAMETOOLONG`.
     pub fn from_env(key: &str) -> Result<Self> {
         let notifier = Notifier::from_env()?.ok_or(Error::NoManager)?;
         let max = fd_store_max().ok_or(Error::NoStore)?;
 
-        Self::new(notifier, key, max)
-    }
-
-    /// The store of the service that `notifier` reaches, under `key`, which takes `max` file
-    /// descriptors, as `FileDescriptorStoreMax=` of the unit sets it.
-    ///
-    /// It fails with [`Error::StoreTooSmall`] if `max` is less than 2, the fewest that a hand-over
-    /// takes: the memfd and a queue socket. The key is 1 to 200 printable ASCII characters other
-    /// than `:` and `/`. For any other key, this fails with [`Error::InvalidName`].
-    pub fn new(notifier: Notifier, key: &str, max: usize) -> Result<Self> {
-        check_key(key)?;
-        if max < MIN_STORE {
-            return Err(Error::StoreTooSmall { max });
-        }
-        let reserve = Reserve::new()
-            .inspect_err(|e| warn!("Failed to keep file descriptors to hand over with: {e}"))
-            .ok();
-
-        Ok(Self {
-            notifier,
-            key: key.to_owned(),
-            max,
-            reserve,
-        })
-    }
-
-    /// The notification socket of the service manager, for the service to tell it that it's
-    /// ready, among other things.
-    pub fn notifier(&self) -> &Notifier {
-        &self.notifier
+        Self::with_notifier(notifier, key, max)
     }
 
     /// Take over from the previous instance: take the file descriptors stored under the key out
@@ -162,8 +145,7 @@ impl Store {
     /// their order, each under its id, for the next instance, and wait for systemd to have dealt
     /// with them.
     ///
-    /// The service does this once it stopped taking requests. This consumes the store and its
-    /// [notifier](Self::notifier), unless the service cloned the notifier.
+    /// The service does this once it stopped taking requests.
     ///
     /// The state of a service that has none is `&[][..]`. zoter doesn't look at the ids, nor
     /// checks that they are unique: it gives each back with its item, for the state to refer to
@@ -194,6 +176,25 @@ impl Store {
             .collect();
 
         self.store_all(&state, &items)
+    }
+
+    /// The store of the service that `notifier` reaches, under `key`, which takes `max` file
+    /// descriptors. It fails as [`from_env`](Self::from_env) does for such a key and size.
+    pub(crate) fn with_notifier(notifier: Notifier, key: &str, max: usize) -> Result<Self> {
+        check_key(key)?;
+        if max < MIN_STORE {
+            return Err(Error::StoreTooSmall { max });
+        }
+        let reserve = Reserve::new()
+            .inspect_err(|e| warn!("Failed to keep file descriptors to hand over with: {e}"))
+            .ok();
+
+        Ok(Self {
+            notifier,
+            key: key.to_owned(),
+            max,
+            reserve,
+        })
     }
 
     /// What the previous instance handed over, out of `passed`, as

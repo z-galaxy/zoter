@@ -12,7 +12,7 @@ use rustix::{
 use super::*;
 use crate::{
     test_utils::{in_own_process, pipe, read_byte},
-    testing::Manager,
+    testing::{self, Manager},
 };
 
 /// What one instance hands over, the next takes over, through the store: the state, and the items
@@ -40,7 +40,7 @@ fn round_trip() {
     let mut passed = manager.passed().unwrap();
     let mut second = store(&manager);
     let mut restored = second.take_over(&mut passed).unwrap().unwrap();
-    second.notifier().barrier(WAIT).unwrap();
+    manager.barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/fds", "test/state"]);
     let names: Vec<_> = passed.iter().map(|(name, _)| name).collect();
     assert_eq!(names, ["test.socket"]);
@@ -92,7 +92,7 @@ fn nothing_to_take_over() {
     let mut passed = manager.passed().unwrap();
     let mut store = store(&manager);
     assert!(store.take_over(&mut passed).unwrap().is_none());
-    store.notifier().barrier(WAIT).unwrap();
+    manager.barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/fds"]);
     assert_eq!(passed.len(), 1);
 }
@@ -114,7 +114,7 @@ fn no_take_over_of_garbage() {
     let mut store = store(&manager);
     let error = store.take_over(&mut passed).unwrap_err();
     assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
-    store.notifier().barrier(WAIT).unwrap();
+    manager.barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/other", "test/state"]);
     let names: Vec<_> = passed.iter().map(|(name, _)| name).collect();
     assert_eq!(names, ["other/state"]);
@@ -128,7 +128,7 @@ fn taking_over_tells_that_the_service_started() {
     let mut passed = manager.passed().unwrap();
     let mut first = store(&manager);
     assert!(first.take_over(&mut passed).unwrap().is_none());
-    first.notifier().barrier(WAIT).unwrap();
+    manager.barrier(WAIT).unwrap();
     assert_eq!(manager.take_notifications(), ["READY=1", "BARRIER=1"]);
 
     first.hand_over(b"state".to_vec(), NO_ITEMS).unwrap();
@@ -144,7 +144,7 @@ fn taking_over_tells_that_the_service_started() {
         let mut passed = manager.passed().unwrap();
         let mut next = store(&manager);
         assert_eq!(next.take_over(&mut passed).is_ok(), taken_over);
-        next.notifier().barrier(WAIT).unwrap();
+        manager.barrier(WAIT).unwrap();
         assert_eq!(
             manager.take_notifications(),
             ["FDSTOREREMOVE=1\nFDNAME=test/state", "READY=1", "BARRIER=1"],
@@ -214,7 +214,7 @@ fn missing_fds_fail_the_take_over() {
     let error = store.take_over(&mut passed).unwrap_err();
     assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
     assert!(error.to_string().contains("item 2 "), "{error}");
-    store.notifier().barrier(WAIT).unwrap();
+    manager.barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/fds", "test/state"]);
 }
 
@@ -272,7 +272,7 @@ fn unsaved_state() {
 fn no_store_without_room() {
     let manager = Manager::new().unwrap();
     for max in [0, 1] {
-        let error = Store::new(manager.notifier().unwrap(), KEY, max).unwrap_err();
+        let error = testing::store(manager.notify_socket(), KEY, max).unwrap_err();
         assert!(
             matches!(error, Error::StoreTooSmall { max: too_few } if too_few == max),
             "{max}: {error:?}"
@@ -282,7 +282,7 @@ fn no_store_without_room() {
             "{error}"
         );
     }
-    Store::new(manager.notifier().unwrap(), KEY, MIN_STORE).unwrap();
+    testing::store(manager.notify_socket(), KEY, MIN_STORE).unwrap();
 }
 
 /// A service hands over what it borrows: its state, and its items out of an iterator over what it
@@ -314,11 +314,11 @@ fn keys() {
     let manager = Manager::new().unwrap();
     let longest = "a".repeat(MAX_KEY_LEN);
     for key in ["busd", "with spaces", "a.b-c_d", &longest] {
-        Store::new(manager.notifier().unwrap(), key, 2).unwrap();
+        testing::store(manager.notify_socket(), key, 2).unwrap();
     }
     let too_long = "a".repeat(MAX_KEY_LEN + 1);
     for key in ["", "a/b", "a:b", "a\nb", "é", &too_long] {
-        let error = Store::new(manager.notifier().unwrap(), key, 2).unwrap_err();
+        let error = testing::store(manager.notify_socket(), key, 2).unwrap_err();
         assert!(matches!(error, Error::InvalidName(_)), "{key:?}: {error:?}");
     }
 }
@@ -424,8 +424,8 @@ fn from_the_environment() {
 
     let store = Store::from_env(KEY).unwrap();
     assert_eq!(store.max, 16);
-    // A number that `$FDSTORE` tells is judged as one that `Store::new` is given: a hand-over
-    // doesn't fit in a store that takes fewer than 2 file descriptors.
+    // A number that `$FDSTORE` tells is judged as one that `testing::store` is given: a
+    // hand-over doesn't fit in a store that takes fewer than 2 file descriptors.
     for max in [0, 1] {
         // SAFETY: The test runs in a process of its own, which has no other thread that reads or
         // writes the environment. So do the ones below.
@@ -482,7 +482,7 @@ fn from_the_environment() {
 /// A store of the manager, under `KEY`, that takes as many file descriptors as the store of the
 /// manager does.
 fn store(manager: &Manager) -> Store {
-    Store::new(manager.notifier().unwrap(), KEY, manager.store_max()).unwrap()
+    testing::store(manager.notify_socket(), KEY, manager.store_max()).unwrap()
 }
 
 /// What the manager passes the next instance, taken over.

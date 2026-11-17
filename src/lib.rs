@@ -17,7 +17,6 @@ mod limit;
 pub use limit::raise_fd_limit;
 mod memfd;
 mod notifier;
-pub use notifier::Notifier;
 mod passed;
 pub use passed::Passed;
 mod queue;

@@ -33,8 +33,6 @@ D-Bus or Varlink:
 
 * [`Passed`] takes the file descriptors that systemd passes a service: the sockets of socket
   activation, and what the previous instance stored.
-* [`Notifier`] is the notification socket of systemd, which stores file descriptors in the store
-  of the service, among other things.
 * [`Store`] hands the service over to its next instance. In the instance that stops,
   [`Store::hand_over`] stores the state of the service and items, such as the connections of its
   clients, each a record of bytes and file descriptors, however many there are. In the next
@@ -44,7 +42,8 @@ D-Bus or Varlink:
 
 A protocol takes part through two traits, [`Save`] and [`Restore`], which the hand-overs of its
 connections implement, so that a service hands those over as they are. The `testing` feature adds
-[`testing::Manager`], a fake service manager, for the tests of the restarts of a service.
+what the tests of the restarts of a service need: [`testing::Manager`], a fake service manager,
+and [`testing::store`], the store of a service that a test runs in its own process.
 
 zoter is named after Soter, the Greek daimon of safety, preservation, and deliverance from harm.
 It builds nothing on platforms other than Linux, where systemd is. Its API is synchronous, and
@@ -164,7 +163,6 @@ In development: the API can change from one minor version to the next.
 </a>
 
 [`Passed`]: https://docs.rs/zoter/latest/zoter/struct.Passed.html
-[`Notifier`]: https://docs.rs/zoter/latest/zoter/struct.Notifier.html
 [`Store`]: https://docs.rs/zoter/latest/zoter/struct.Store.html
 [`Store::from_env`]: https://docs.rs/zoter/latest/zoter/struct.Store.html#method.from_env
 [`Store::hand_over`]: https://docs.rs/zoter/latest/zoter/struct.Store.html#method.hand_over
@@ -173,6 +171,7 @@ In development: the API can change from one minor version to the next.
 [`Save`]: https://docs.rs/zoter/latest/zoter/trait.Save.html
 [`Restore`]: https://docs.rs/zoter/latest/zoter/trait.Restore.html
 [`testing::Manager`]: https://docs.rs/zoter/latest/zoter/testing/struct.Manager.html
+[`testing::store`]: https://docs.rs/zoter/latest/zoter/testing/fn.store.html
 [`zoter::Result`]: https://docs.rs/zoter/latest/zoter/type.Result.html
 [`Error`]: https://docs.rs/zoter/latest/zoter/enum.Error.html
 [`Error::NoManager`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.NoManager

@@ -207,14 +207,16 @@ executing itself anew, take FDs that are long closed, or other ones under their 
 takes the FDs as its own, by their numbers, which is only sound if nothing else in the process
 owns them already, as something does that took them before.
 
-### `Notifier`: the notification socket
+### `Notifier`: the notification socket, private
 
 This is busd's `Notifier` with `zoter::Result` in place of `io::Result`:
 `from_env() -> zoter::Result<Option<Self>>`, `new(address)`, `notify(&str)`,
-`notify_with_fds(&str, &[BorrowedFd])`, `store(name, &[BorrowedFd])`, `remove(name)` and
-`barrier(Duration)`. It adds `try_clone()`. `store` always sends `FDPOLL=0`, so that systemd doesn't
-close a stored socket whose peer hung up before the next instance read what the peer sent. States
-stay strings (`"READY=1"`, `"STOPPING=1"`, `"EXTEND_TIMEOUT_USEC=…"`); typed states can come later.
+`store(name, &[BorrowedFd])`, `remove(name)` and `barrier(Duration)`. `store` always sends
+`FDPOLL=0`, so that systemd doesn't close a stored socket whose peer hung up before the next
+instance read what the peer sent.
+
+It is private to the crate: a `Store` tells systemd everything that a restart takes, so a service
+never sends a notification itself, and needs to know of none.
 
 ### `Store`: the store of the service, under a key
 
@@ -231,12 +233,9 @@ impl Store {
     /// The store that systemd keeps for the service, which `$NOTIFY_SOCKET` reaches and which
     /// takes `$FDSTORE` FDs. It fails with `Error::NoManager` if `$NOTIFY_SOCKET` is unset or
     /// empty: systemd takes no notifications from the process, as when it doesn't run it. It
-    /// fails with `Error::NoStore` if `$FDSTORE` is unset or not a number.
+    /// fails with `Error::NoStore` if `$FDSTORE` is unset or not a number, and with
+    /// `Error::StoreTooSmall` if it is less than 2 (the state memfd and a queue socket).
     pub fn from_env(key: &str) -> zoter::Result<Self>;
-    /// The store of the service that `notifier` reaches, taking `max` FDs. It fails with
-    /// `Error::StoreTooSmall` if `max` is less than 2 (the state memfd and a queue socket).
-    pub fn new(notifier: Notifier, key: &str, max: usize) -> zoter::Result<Self>;
-    pub fn notifier(&self) -> &Notifier;
     /// Take over from the previous instance: take the FDs stored under the key out of `passed`,
     /// remove them from the store, and read the whole hand-over that they hold, if any. It fails
     /// with `Error::Io` of `EMFILE` if the FDs don't fit under the process's soft limit of open
@@ -326,7 +325,7 @@ pub enum Error {
     Io(io::Error),
     /// `$LISTEN_PID`, `$LISTEN_FDS`, `$LISTEN_FDNAMES` or `$NOTIFY_SOCKET` has an invalid value.
     Environment(String),
-    /// A store key or an FD name that zoter does not accept.
+    /// A store key that zoter does not accept.
     InvalidName(String),
     /// No service manager takes notifications from the process.
     NoManager,
@@ -405,9 +404,9 @@ Creating the store:
   it doesn't run it: `Store::from_env` fails with `Error::NoManager`.
 - systemd takes notifications from the service, but keeps no store for it (`$FDSTORE` is unset or
   not a number): `Store::from_env` fails with `Error::NoStore`.
-- The store takes fewer than 2 FDs: `Store::from_env` and `Store::new` fail with
-  `Error::StoreTooSmall`. `Store::new` alone judges the number, so a `$FDSTORE` of 0, which systemd
-  never sets, fails as a `max` of 0 does.
+- The store takes fewer than 2 FDs: `Store::from_env` fails with `Error::StoreTooSmall`. One
+  check judges the number, for it and for `testing::store` alike, so a `$FDSTORE` of 0, which
+  systemd never sets, fails as a size of 0 does.
 
 Either way the service has no `Store`, so it neither takes over nor hands over.
 
@@ -449,10 +448,13 @@ gives it, under their names, and starts a service as systemd does: `Manager::com
 gives a `std::process::Command` with `$NOTIFY_SOCKET`, `$FDSTORE`, `$LISTEN_FDS` and
 `$LISTEN_FDNAMES` set, the passed FDs from 3 on, and `$LISTEN_PID` set to the PID of the service.
 It leaves `$FDSTORE` unset for a store that takes no FDs, as systemd does.
-For a service that runs in the test process, `Manager::notifier` and `Manager::passed` give what
-`Store::from_env` and `Passed::from_env` would. Tests wait for a state
-(`wait_for("READY=1", timeout)`), look at the store, and empty it, as a stop does. busd, zbus and
-zlink test their restarts with it.
+For a service that runs in the test process, `testing::store` gives the store that
+`Store::from_env` would, out of `Manager::notify_socket` and `Manager::store_max`, and
+`Manager::passed` gives what `Passed::from_env` would. Tests wait for a state
+(`wait_for("READY=1", timeout)`), wait for the manager to have dealt with what a service sent
+(`barrier(timeout)`), look at the store, and empty it, as a stop does. busd, zbus and zlink test
+their restarts with it. They build the crate as a dependency, as its own integration test and
+benchmark do, where `cfg(test)` is off: hence a feature.
 
 It needs `libc`, which rustix doesn't replace there: `dup2` onto FDs that the child doesn't own yet,
 and `kcmp(2)`, to tell FDs of one open file description apart as systemd does. Both are optional
@@ -525,7 +527,7 @@ With a feature on Linux, with `std`, as the hand-over of zbus is:
 
 ### busd
 
-- `src/systemd.rs` goes: busd uses `zoter::{Passed, Notifier, Store}`.
+- `src/systemd.rs` goes: busd uses `zoter::{Passed, Store}`.
 - `src/bus/systemd.rs` keeps the bus's side: `Bus::for_systemd` takes over through
   `Store::take_over`, decodes its state, restores each client's connection with
   `RestoredItem::restore::<connection::Handover>`, by id, and listens on the one socket of socket
@@ -576,6 +578,12 @@ restarts. It is free on crates.io, and its repository is `z-galaxy/zoter`.
     which socket activation makes up for: the clients wait in sockets that systemd keeps. A
     service that binds a socket of its own after it took over has started, for systemd, a moment
     before it listens.
+11. `Notifier` is private. The first version had it in the API, for a service to tell systemd that
+    it's ready, among other things, and to store file descriptors of its own. `Store::take_over`
+    tells the former now, and nothing called for the rest. `Store::new`, which took a `Notifier`,
+    went with it: only tests and benchmarks created a `Store` that way, so `testing::store` does
+    it for them, from the address of the notification socket. Tests wait for the fake manager
+    with `Manager::barrier` in place of `Manager::notifier`.
 
 ## The plan
 

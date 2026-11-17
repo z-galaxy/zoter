@@ -1,4 +1,5 @@
-//! The notification socket of the service manager: [`Notifier`].
+//! The notification socket of the service manager, which a [`Store`](crate::Store) keeps to itself:
+//! [`Notifier`].
 
 use std::{
     env,
@@ -37,7 +38,7 @@ use crate::{Error, Result};
 /// manager is far behind, but it doesn't wait for the manager to read the message. The manager
 /// says nothing back, so [`barrier`](Self::barrier) is how to tell that it got to the messages.
 #[derive(Debug)]
-pub struct Notifier {
+pub(crate) struct Notifier {
     socket: OwnedFd,
     address: SocketAddrUnix,
 }
@@ -48,7 +49,7 @@ impl Notifier {
     /// systemd sets it for the services that take notifications. So `None` means that this
     /// service doesn't take them, or isn't a systemd service at all. This leaves the variable in
     /// the environment. It fails in the same cases as [`new`](Self::new).
-    pub fn from_env() -> Result<Option<Self>> {
+    pub(crate) fn from_env() -> Result<Option<Self>> {
         match env::var_os("NOTIFY_SOCKET") {
             Some(address) if !address.is_empty() => Self::new(address).map(Some),
             _ => Ok(None),
@@ -63,7 +64,7 @@ impl Notifier {
     /// tell its host that it has booted. zoter doesn't support them: they fail with
     /// [`Error::Environment`] too, like any other address that is neither a path nor an abstract
     /// name. A name too long for a socket address fails with [`Error::Io`] of `ENAMETOOLONG`.
-    pub fn new(address: impl AsRef<OsStr>) -> Result<Self> {
+    pub(crate) fn new(address: impl AsRef<OsStr>) -> Result<Self> {
         let address = match address.as_ref().as_bytes() {
             [b'/' | b'@'] => {
                 return Err(Error::Environment(
@@ -90,14 +91,6 @@ impl Notifier {
         Ok(Self { socket, address })
     }
 
-    /// Another notifier of the same manager, with a socket of its own.
-    pub fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            socket: self.socket.try_clone()?,
-            address: self.address.clone(),
-        })
-    }
-
     /// Store `fds` in the store under `name`.
     ///
     /// The manager keeps a duplicate of each of them for the service, and hands it to the main
@@ -120,7 +113,7 @@ impl Notifier {
     /// it for an empty name: systemd accepts one, but it is more likely a mistake than a real name.
     /// A message has one name for all of its file descriptors, so file descriptors that need
     /// different names need one call each.
-    pub fn store(&self, name: &str, fds: &[BorrowedFd<'_>]) -> Result<()> {
+    pub(crate) fn store(&self, name: &str, fds: &[BorrowedFd<'_>]) -> Result<()> {
         check_name(name)?;
 
         self.notify_with_fds(&format!("FDSTORE=1\nFDPOLL=0\nFDNAME={name}"), fds)
@@ -132,7 +125,7 @@ impl Notifier {
     /// process lets go of a socket that it stored: while the manager has a copy of it, the peer of
     /// a connection doesn't see the connection end when the process closes its own. The name has to
     /// be a valid one, as for [`store`](Self::store).
-    pub fn remove(&self, name: &str) -> Result<()> {
+    pub(crate) fn remove(&self, name: &str) -> Result<()> {
         check_name(name)?;
 
         self.notify(&format!("FDSTOREREMOVE=1\nFDNAME={name}"))
@@ -143,7 +136,7 @@ impl Notifier {
     /// `state` is a list of assignments such as `READY=1`, each on a line of its own. The manager
     /// takes a message of 4096 bytes at most, and ignores a longer one, as well as one that it
     /// can't make sense of, so this only fails if the message can't be sent.
-    pub fn notify(&self, state: &str) -> Result<()> {
+    pub(crate) fn notify(&self, state: &str) -> Result<()> {
         self.notify_with_fds(state, &[])
     }
 
@@ -159,7 +152,7 @@ impl Notifier {
     ///
     /// It fails with [`Error::TimedOut`] if the manager takes longer than `timeout`. It blocks the
     /// thread while it waits.
-    pub fn barrier(&self, timeout: Duration) -> Result<()> {
+    pub(crate) fn barrier(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now().checked_add(timeout);
         // The manager has the only other copy of the write end once this sends it, and closes it
         // once it gets to the message, which hangs up the read end.
@@ -184,7 +177,7 @@ impl Notifier {
     /// them. [`store`](Self::store) sends such messages. A message holds at most 253 file
     /// descriptors, the most that Linux passes at once. More fail with [`Error::Io`] of `E2BIG`,
     /// and no message is sent.
-    pub fn notify_with_fds(&self, state: &str, fds: &[BorrowedFd<'_>]) -> Result<()> {
+    fn notify_with_fds(&self, state: &str, fds: &[BorrowedFd<'_>]) -> Result<()> {
         if fds.len() > MAX_FDS {
             return Err(Error::os(Errno::TOOBIG));
         }
@@ -382,17 +375,6 @@ mod tests {
         assert_eq!(os_error(error), Errno::NOENT);
         let error = notifier.barrier(Duration::from_secs(1)).unwrap_err();
         assert_eq!(os_error(error), Errno::NOENT);
-    }
-
-    #[test]
-    fn clones_reach_the_same_manager() {
-        for (manager, notifier) in managers() {
-            let clone = notifier.try_clone().unwrap();
-            drop(notifier);
-
-            clone.notify("READY=1").unwrap();
-            assert_eq!(manager.receive().0, "READY=1");
-        }
     }
 
     #[test]

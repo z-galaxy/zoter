@@ -61,7 +61,8 @@ src/
 ├── log.rs         # warn!/debug! through `tracing`, or nothing without the feature
 ├── save.rs        # Save and Restore: what an item of a hand-over is, a record and FDs
 ├── passed.rs      # Passed: the FDs that systemd passes, as sd_listen_fds(3) takes them
-├── notifier.rs    # Notifier: $NOTIFY_SOCKET, as sd_notify(3) has it, storing FDs and barriers
+├── notifier.rs    # Notifier, private: $NOTIFY_SOCKET, as sd_notify(3) has it, storing FDs,
+│                  # barriers
 ├── limit.rs       # raise_fd_limit
 ├── store.rs       # Store: take_over and hand_over, queueing the FDs, the reserved FDs;
 │                  # Stored: what a hand-over stored
@@ -70,7 +71,8 @@ src/
 ├── layout.rs      # The format of the memfd: header, table of the items, records
 ├── memfd.rs       # Sealed memfds, written and read in place through mappings (the unsafe code)
 ├── queue.rs       # Sockets whose queues hold any number of FDs, as one FD of the store
-├── testing.rs     # [testing feature] Manager: a fake service manager for tests
+├── testing.rs     # [testing feature] Manager: a fake service manager for tests; store: the
+│                  # store of a service that a test runs in its own process
 └── test_utils.rs  # What the unit tests share, such as running a test in a process of its own
 tests/restart.rs   # [testing feature] A restart end to end: the test binary is the service
 benches/handover.rs # [testing feature] What storing a hand-over and taking it over cost

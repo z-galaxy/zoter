@@ -28,18 +28,16 @@ pub enum Error {
     /// that makes no sense.
     ///
     /// [`Passed::from_env`](crate::Passed::from_env) fails with it for an invalid `$LISTEN_PID`,
-    /// `$LISTEN_FDS` or `$LISTEN_FDNAMES`. [`Notifier::new`](crate::Notifier::new) fails with it
-    /// for an address, such as the value of `$NOTIFY_SOCKET`, that is neither a path nor an
-    /// abstract name. It also fails with it for a `/` or an `@` alone, which names nothing. The
-    /// fault lies with whoever set the environment, not with the service. Converted into an
-    /// [`io::Error`], it has the kind [`io::ErrorKind::InvalidData`].
+    /// `$LISTEN_FDS` or `$LISTEN_FDNAMES`. [`Store::from_env`](crate::Store::from_env) fails with
+    /// it for a `$NOTIFY_SOCKET` that is neither a path nor an abstract name, and for a `/` or an
+    /// `@` alone, which names nothing. The fault lies with whoever set the environment, not with
+    /// the service. Converted into an [`io::Error`], it has the kind
+    /// [`io::ErrorKind::InvalidData`].
     Environment(String),
-    /// A store key or a file descriptor name that zoter does not accept.
+    /// A store key that zoter does not accept.
     ///
-    /// [`Store::new`](crate::Store::new) fails with it for a key.
-    /// [`Notifier::store`](crate::Notifier::store) and
-    /// [`Notifier::remove`](crate::Notifier::remove) fail with it for a name. The message lists the
-    /// allowed characters. Converted into an [`io::Error`], it has the kind
+    /// [`Store::from_env`](crate::Store::from_env) fails with it. The message lists the allowed
+    /// characters. Converted into an [`io::Error`], it has the kind
     /// [`io::ErrorKind::InvalidInput`].
     InvalidName(String),
     /// No service manager takes notifications from the process.
@@ -60,9 +58,9 @@ pub enum Error {
     NoStore,
     /// The store takes fewer file descriptors than any hand-over needs.
     ///
-    /// [`Store::from_env`](crate::Store::from_env) and [`Store::new`](crate::Store::new) fail with
-    /// it. The service's `FileDescriptorStoreMax=` raises the number. Converted into an
-    /// [`io::Error`], it has the kind [`io::ErrorKind::Unsupported`].
+    /// [`Store::from_env`](crate::Store::from_env) fails with it. The service's
+    /// `FileDescriptorStoreMax=` raises the number. Converted into an [`io::Error`], it has the
+    /// kind [`io::ErrorKind::Unsupported`].
     StoreTooSmall {
         /// The number of file descriptors that the store takes.
         max: usize,
@@ -103,9 +101,8 @@ pub enum Error {
     UnsupportedHandover(String),
     /// The service manager did not process the messages sent to it in time.
     ///
-    /// [`Notifier::barrier`](crate::Notifier::barrier) fails with it.
     /// [`Store::hand_over`](crate::Store::hand_over) waits for systemd to process what it stored,
-    /// and fails with it too. Converted into an [`io::Error`], it has the kind
+    /// and fails with it. Converted into an [`io::Error`], it has the kind
     /// [`io::ErrorKind::TimedOut`].
     TimedOut,
 }
