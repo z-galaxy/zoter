@@ -61,7 +61,7 @@ fn serve() {
     // SAFETY: The test runs in a process of its own, whose other threads don't read or write the
     // environment, and where nothing took the file descriptors that the manager passed.
     let mut passed = unsafe { Passed::from_env() }.unwrap();
-    let mut store = Store::from_env(KEY).unwrap().unwrap();
+    let mut store = Store::from_env(KEY, &passed).unwrap();
     let restored = store.take_over(&mut passed).unwrap();
     let listener = UnixListener::from(passed.take(SOCKET).unwrap());
     let (mut count, client) = match restored {
@@ -72,15 +72,8 @@ fn serve() {
 
             (count, UnixStream::from(item.restore::<OwnedFd>().unwrap()))
         }
-        None => {
-            store.notifier().notify("READY=1").unwrap();
-
-            (0, listener.accept().unwrap().0)
-        }
+        None => (0, listener.accept().unwrap().0),
     };
-    if count > 0 {
-        store.notifier().notify("READY=1").unwrap();
-    }
 
     let mut request = String::new();
     BufReader::new(&client).read_line(&mut request).unwrap();
@@ -89,10 +82,9 @@ fn serve() {
 
     // The standard input ends as the test stops this instance.
     io::stdin().read_to_end(&mut Vec::new()).unwrap();
-    let handover = store.handover().unwrap();
     let state = count.to_le_bytes();
-    let stored = handover
-        .store(&state[..], [(CLIENT, client.as_fd())])
+    let stored = store
+        .hand_over(&state[..], [(CLIENT, client.as_fd())])
         .unwrap();
     assert_eq!((stored.items(), stored.fds()), (1, 1));
 }

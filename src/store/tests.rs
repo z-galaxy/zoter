@@ -12,7 +12,7 @@ use rustix::{
 use super::*;
 use crate::{
     test_utils::{in_own_process, pipe, read_byte},
-    testing::Manager,
+    testing::{self, Manager},
 };
 
 /// What one instance hands over, the next takes over, through the store: the state, and the items
@@ -32,11 +32,7 @@ fn round_trip() {
     let twice = Item::new(b"", twice);
     let items: [(u64, &dyn Save); 4] = [(1, &bytes), (2, &write_a), (3, &many), (u64::MAX, &twice)];
     let state = Item::new(b"state", vec![write_b]);
-    let stored = store(&manager)
-        .handover()
-        .unwrap()
-        .store(state, items)
-        .unwrap();
+    let stored = store(&manager).hand_over(state, items).unwrap();
     assert_eq!(stored.items(), 4);
     assert_eq!(stored.fds(), 1 + 1 + MAX_FDS + 10 + 2);
     assert_eq!(manager.stored_names(), ["test/state", "test/fds"]);
@@ -44,7 +40,7 @@ fn round_trip() {
     let mut passed = manager.passed().unwrap();
     let mut second = store(&manager);
     let mut restored = second.take_over(&mut passed).unwrap().unwrap();
-    second.notifier().barrier(WAIT).unwrap();
+    manager.barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/fds", "test/state"]);
     let names: Vec<_> = passed.iter().map(|(name, _)| name).collect();
     assert_eq!(names, ["test.socket"]);
@@ -96,7 +92,7 @@ fn nothing_to_take_over() {
     let mut passed = manager.passed().unwrap();
     let mut store = store(&manager);
     assert!(store.take_over(&mut passed).unwrap().is_none());
-    store.notifier().barrier(WAIT).unwrap();
+    manager.barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/fds"]);
     assert_eq!(passed.len(), 1);
 }
@@ -117,20 +113,53 @@ fn no_take_over_of_garbage() {
     let mut passed = manager.passed().unwrap();
     let mut store = store(&manager);
     let error = store.take_over(&mut passed).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidData);
-    store.notifier().barrier(WAIT).unwrap();
+    assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
+    manager.barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/other", "test/state"]);
     let names: Vec<_> = passed.iter().map(|(name, _)| name).collect();
     assert_eq!(names, ["other/state"]);
+}
+
+/// Taking over tells the manager that the service has started, after it removed what it took
+/// from the store: with a hand-over, with none, and with one that it fails to take over.
+#[test]
+fn taking_over_tells_that_the_service_started() {
+    let manager = Manager::new().unwrap();
+    let mut passed = manager.passed().unwrap();
+    let mut first = store(&manager);
+    assert!(first.take_over(&mut passed).unwrap().is_none());
+    manager.barrier(WAIT).unwrap();
+    assert_eq!(manager.take_notifications(), ["READY=1", "BARRIER=1"]);
+
+    first.hand_over(b"state".to_vec(), NO_ITEMS).unwrap();
+    manager.take_notifications();
+    let garbage = memfd::sealed("test", b"not a hand-over").unwrap();
+    for taken_over in [true, false] {
+        if !taken_over {
+            manager.replace_store(vec![(
+                "test/state".to_owned(),
+                garbage.try_clone().unwrap(),
+            )]);
+        }
+        let mut passed = manager.passed().unwrap();
+        let mut next = store(&manager);
+        assert_eq!(next.take_over(&mut passed).is_ok(), taken_over);
+        manager.barrier(WAIT).unwrap();
+        assert_eq!(
+            manager.take_notifications(),
+            ["FDSTOREREMOVE=1\nFDNAME=test/state", "READY=1", "BARRIER=1"],
+            "taken over: {taken_over}"
+        );
+    }
 }
 
 /// An item that can't be saved, as one whose record fails to be saved, fails the hand-over, naming
 /// the item, and nothing is stored.
 #[test]
 fn unsaved_items_fail_the_hand_over() {
-    for unsaved in [
-        Box::new(Unsaved) as Box<dyn Save>,
-        Box::new(Failing(pipe().1)),
+    for (unsaved, failed) in [
+        (Box::new(Unsaved) as Box<dyn Save>, false),
+        (Box::new(Failing(pipe().1)), true),
     ] {
         let manager = Manager::new().unwrap();
         let items: [(u64, Box<dyn Save>); 3] = [
@@ -138,9 +167,15 @@ fn unsaved_items_fail_the_hand_over() {
             (2, unsaved),
             (3, Box::new(Item::new(b"three", vec![pipe().1]))),
         ];
-        let handover = store(&manager).handover().unwrap();
-        let error = handover.store(&[][..], items).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        let error = store(&manager).hand_over(&[][..], items).unwrap_err();
+        let Error::Unsaved {
+            item: Some(2),
+            source,
+        } = &error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(source.is_some(), failed, "{error:?}");
         assert!(error.to_string().contains("item 2 "), "{error}");
 
         let mut passed = manager.passed().unwrap();
@@ -158,11 +193,7 @@ fn missing_fds_fail_the_take_over() {
         (2, Item::new(b"two", vec![pipe().1, pipe().1])),
         (3, Item::new(b"three", vec![pipe().1])),
     ];
-    store(&manager)
-        .handover()
-        .unwrap()
-        .store(&[][..], items)
-        .unwrap();
+    store(&manager).hand_over(&[][..], items).unwrap();
 
     // The second file descriptor, the first of the second item, goes missing.
     let mut stored = manager.stored().unwrap();
@@ -181,9 +212,9 @@ fn missing_fds_fail_the_take_over() {
     let mut passed = manager.passed().unwrap();
     let mut store = store(&manager);
     let error = store.take_over(&mut passed).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
     assert!(error.to_string().contains("item 2 "), "{error}");
-    store.notifier().barrier(WAIT).unwrap();
+    manager.barrier(WAIT).unwrap();
     assert_eq!(manager.take_removed(), ["test/fds", "test/state"]);
 }
 
@@ -202,11 +233,7 @@ fn take_over_over_the_fd_limit() {
         .take(32)
         .collect();
     let items = [(1, Item::new(b"many", fds))];
-    store(&manager)
-        .handover()
-        .unwrap()
-        .store(&[][..], items)
-        .unwrap();
+    store(&manager).hand_over(&[][..], items).unwrap();
     let mut passed = manager.passed().unwrap();
     let mut store = store(&manager);
     // Room for a few file descriptors more than are open, which the manager adds to as it closes
@@ -217,61 +244,69 @@ fn take_over_over_the_fd_limit() {
     setrlimit(Resource::Nofile, limit).unwrap();
 
     let error = store.take_over(&mut passed).unwrap_err();
-    assert_eq!(
-        error.raw_os_error(),
-        Some(Errno::MFILE.raw_os_error()),
-        "{error}"
+    assert!(
+        matches!(&error, Error::Io(e) if e.raw_os_error() == Some(Errno::MFILE.raw_os_error())),
+        "{error:?}"
     );
 }
 
 /// A state that can't be saved fails the hand-over, as one that fails to be saved does.
 #[test]
 fn unsaved_state() {
-    for state in [
-        Box::new(Unsaved) as Box<dyn Save>,
-        Box::new(Failing(pipe().1)),
+    for (state, failed) in [
+        (Box::new(Unsaved) as Box<dyn Save>, false),
+        (Box::new(Failing(pipe().1)), true),
     ] {
         let manager = Manager::new().unwrap();
-        let handover = store(&manager).handover().unwrap();
-        let error = handover.store(state, NO_ITEMS).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        let error = store(&manager).hand_over(state, NO_ITEMS).unwrap_err();
+        let Error::Unsaved { item: None, source } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(source.is_some(), failed, "{error:?}");
     }
 }
 
-/// A store that takes no hand-over, as one without `$FDSTORE` or of fewer than 2 file descriptors,
-/// starts none.
+/// A store that takes fewer than 2 file descriptors can't hold a hand-over, so creating it fails.
+/// The error names the unit setting to raise.
 #[test]
-fn no_hand_over_without_room() {
+fn no_store_without_room() {
     let manager = Manager::new().unwrap();
-    for max in [None, Some(0), Some(1)] {
-        let store = Store::new(manager.notifier().unwrap(), KEY, max).unwrap();
-        let error = store.handover().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported, "{max:?}");
+    for max in [0, 1] {
+        let error = testing::store(manager.notify_socket(), KEY, max).unwrap_err();
+        assert!(
+            matches!(error, Error::StoreTooSmall { max: too_few } if too_few == max),
+            "{max}: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("`FileDescriptorStoreMax=`"),
+            "{error}"
+        );
     }
+    testing::store(manager.notify_socket(), KEY, MIN_STORE).unwrap();
 }
 
-/// A hand-over starts before the service has what it hands over, which it hands over borrowed, as
-/// an async service has it once it stopped taking requests.
+/// A service hands over what it borrows: its state, and its items out of an iterator over what it
+/// holds, as an async service has them once it stopped taking requests.
 #[test]
-fn items_made_once_started() {
+fn borrowed_state_and_items() {
     let manager = Manager::new().unwrap();
-    let handover = store(&manager).handover().unwrap();
+    let store = store(&manager);
     let clients = [(4, pipe().1), (2, pipe().1)];
     let state = b"state".to_vec();
     let items = clients.iter().map(|(id, client)| (*id, client));
-    let stored = handover.store(&state, items).unwrap();
+    let stored = store.hand_over(&state, items).unwrap();
     assert_eq!((stored.items(), stored.fds()), (2, 2));
 
     assert_eq!(ids(take_over(&manager)), [4, 2]);
 }
 
-/// A hand-over is `Send`, so that an async service can hold one across the awaits of stopping, on
-/// a runtime of several threads.
+/// A store is `Send`, so that an async service can hold it across the awaits of serving and of
+/// stopping, on a runtime of several threads.
 #[test]
-fn handover_is_send() {
+fn store_is_send() {
     fn send<T: Send>() {}
 
-    send::<Handover>();
+    send::<Store>();
 }
 
 #[test]
@@ -279,12 +314,12 @@ fn keys() {
     let manager = Manager::new().unwrap();
     let longest = "a".repeat(MAX_KEY_LEN);
     for key in ["busd", "with spaces", "a.b-c_d", &longest] {
-        Store::new(manager.notifier().unwrap(), key, Some(2)).unwrap();
+        testing::store(manager.notify_socket(), key, 2).unwrap();
     }
     let too_long = "a".repeat(MAX_KEY_LEN + 1);
     for key in ["", "a/b", "a:b", "a\nb", "é", &too_long] {
-        let error = Store::new(manager.notifier().unwrap(), key, Some(2)).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{key:?}");
+        let error = testing::store(manager.notify_socket(), key, 2).unwrap_err();
+        assert!(matches!(error, Error::InvalidName(_)), "{key:?}: {error:?}");
     }
 }
 
@@ -350,7 +385,7 @@ fn queued_fds_that_overflow_the_store() {
         Ok(())
     })
     .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::StorageFull);
+    assert!(matches!(error, Error::StoreFull), "{error:?}");
     assert!(
         error.to_string().contains("`FileDescriptorStoreMax=`"),
         "{error}"
@@ -362,7 +397,7 @@ fn queued_fds_that_overflow_the_store() {
 
     // A store without room takes none, but for none at all.
     let error = queue_fds([&fds[..]], 0, |_| unreachable!()).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::StorageFull);
+    assert!(matches!(error, Error::StoreFull), "{error:?}");
     queue_fds([], 0, |_| unreachable!()).unwrap();
 }
 
@@ -381,38 +416,175 @@ fn items_take_their_fds() {
 }
 
 #[test]
-fn store_max() {
-    assert_eq!(parse_store_max(Some("16")), Some(16));
-    assert_eq!(parse_store_max(Some("1")), Some(1));
-    assert_eq!(parse_store_max(None), None);
-    for value in ["", "0", "-1", "x", "1.5", " 1", "99999999999999999999"] {
-        assert_eq!(parse_store_max(Some(value)), None, "$FDSTORE={value:?}");
-    }
-}
-
-#[test]
 fn from_the_environment() {
     let exports = "NOTIFY_SOCKET=/run/systemd/notify FDSTORE=16";
     if !in_own_process("store::tests::from_the_environment", exports) {
         return;
     }
 
-    let store = Store::from_env(KEY).unwrap().unwrap();
-    assert_eq!(store.max(), Some(16));
-    // SAFETY: The test runs in a process of its own, which has no other thread that reads or
-    // writes the environment. So do the ones below.
+    let passed = passed(&["web"]);
+    let store = Store::from_env(KEY, &passed).unwrap();
+    assert_eq!(store.max, 16);
+    // A number that `$FDSTORE` tells is judged as one that `testing::store` is given: a
+    // hand-over doesn't fit in a store that takes fewer than 2 file descriptors.
+    for max in [0, 1] {
+        // SAFETY: The test runs in a process of its own, which has no other thread that reads or
+        // writes the environment. So do the ones below.
+        unsafe { env::set_var("FDSTORE", max.to_string()) };
+        let error = Store::from_env(KEY, &passed).unwrap_err();
+        assert!(
+            matches!(error, Error::StoreTooSmall { max: too_few } if too_few == max),
+            "{max}: {error:?}"
+        );
+    }
+    // Without a number in `$FDSTORE`, systemd keeps no store for the service that it takes
+    // notifications from, and the error names the unit setting that has it keep one.
+    for value in ["", "-1", "x", "1.5", " 1", "99999999999999999999"] {
+        // SAFETY: As above.
+        unsafe { env::set_var("FDSTORE", value) };
+        let error = Store::from_env(KEY, &passed).unwrap_err();
+        assert!(
+            matches!(error, Error::NoStore),
+            "$FDSTORE={value:?}: {error:?}"
+        );
+    }
+    // SAFETY: As above.
     unsafe { env::remove_var("FDSTORE") };
-    let store = Store::from_env(KEY).unwrap().unwrap();
-    assert_eq!(store.max(), None);
+    let error = Store::from_env(KEY, &passed).unwrap_err();
+    assert!(matches!(error, Error::NoStore), "{error:?}");
+    assert!(
+        error.to_string().contains("`FileDescriptorStoreMax=`"),
+        "{error}"
+    );
+    // Without a notification socket, systemd takes no notifications from the process, as when it
+    // doesn't run it at all, which is an error of its own, whatever `$FDSTORE` tells.
+    for fd_store in [None, Some("16")] {
+        for socket in [Some(""), None] {
+            // SAFETY: As above.
+            unsafe {
+                match fd_store {
+                    Some(fd_store) => env::set_var("FDSTORE", fd_store),
+                    None => env::remove_var("FDSTORE"),
+                }
+                match socket {
+                    Some(socket) => env::set_var("NOTIFY_SOCKET", socket),
+                    None => env::remove_var("NOTIFY_SOCKET"),
+                }
+            }
+            let error = Store::from_env(KEY, &passed).unwrap_err();
+            assert!(
+                matches!(error, Error::NoManager),
+                "$NOTIFY_SOCKET={socket:?} $FDSTORE={fd_store:?}: {error:?}"
+            );
+        }
+    }
+}
+
+/// A store needs a socket of socket activation: something systemd passed other than what is stored
+/// under its key.
+#[test]
+fn no_store_without_a_socket() {
+    let exports = "NOTIFY_SOCKET=/run/systemd/notify FDSTORE=16";
+    if !in_own_process("store::tests::no_store_without_a_socket", exports) {
+        return;
+    }
+
+    let state = format!("{KEY}/state");
+    let fds = format!("{KEY}/fds");
+    let no_socket = |names: &[&str]| {
+        let error = Store::from_env(KEY, &passed(names)).unwrap_err();
+        assert!(matches!(error, Error::NoSocket), "{names:?}: {error:?}");
+        assert!(error.to_string().contains("`Requires=`"), "{error}");
+        assert_eq!(io::Error::from(error).kind(), io::ErrorKind::Unsupported);
+    };
+    // Nothing is passed, or only what is stored under the key.
+    no_socket(&[]);
+    no_socket(&[&state, &fds]);
+    no_socket(&[&fds, &fds, &state]);
+
+    assert_eq!(Store::from_env(KEY, &passed(&["web"])).unwrap().max, 16);
+    assert!(Store::from_env(KEY, &passed(&["web", &state, &fds])).is_ok());
+    assert!(Store::from_env(KEY, &passed(&[&state, "web"])).is_ok());
+    // A name that only starts as the key does is another key's, which counts as a socket.
+    assert!(Store::from_env(KEY, &passed(&["test"])).is_ok());
+    assert!(Store::from_env(KEY, &passed(&[&format!("{KEY}x/state")])).is_ok());
+}
+
+/// A store is made whether or not the socket was taken out of `passed` before, as a service takes
+/// its socket as it likes, before or after it makes the store.
+#[test]
+fn store_with_the_socket_taken_before() {
+    let exports = "NOTIFY_SOCKET=/run/systemd/notify FDSTORE=16";
+    if !in_own_process("store::tests::store_with_the_socket_taken_before", exports) {
+        return;
+    }
+
+    let mut passed = passed(&["web", &format!("{KEY}/state")]);
+    assert!(passed.take("web").is_some());
+    assert!(passed.take_prefixed(&format!("{KEY}/")).len() == 1);
+    assert!(passed.is_empty());
+    assert!(Store::from_env(KEY, &passed).is_ok());
+}
+
+/// A file descriptor under the name of another key counts as a socket.
+#[test]
+fn store_with_a_name_under_another_key() {
+    let exports = "NOTIFY_SOCKET=/run/systemd/notify FDSTORE=16";
+    if !in_own_process("store::tests::store_with_a_name_under_another_key", exports) {
+        return;
+    }
+
+    let passed = passed(&["other/state", "other/fds"]);
+    assert!(Store::from_env(KEY, &passed).is_ok());
+}
+
+/// The error for a missing store comes before that for a missing socket, and that for a missing
+/// manager before both.
+#[test]
+fn the_checks_of_from_env_come_in_order() {
+    let exports = "NOTIFY_SOCKET=/run/systemd/notify";
+    if !in_own_process(
+        "store::tests::the_checks_of_from_env_come_in_order",
+        exports,
+    ) {
+        return;
+    }
+
+    let nothing = passed(&[]);
+    let error = Store::from_env(KEY, &nothing).unwrap_err();
+    assert!(matches!(error, Error::NoStore), "{error:?}");
+    // SAFETY: The test runs in a process of its own, which has no other thread that reads or
+    // writes the environment.
+    unsafe { env::set_var("FDSTORE", "1") };
+    let error = Store::from_env(KEY, &nothing).unwrap_err();
+    assert!(
+        matches!(error, Error::StoreTooSmall { max: 1 }),
+        "{error:?}"
+    );
+    // SAFETY: As above.
+    unsafe { env::set_var("FDSTORE", "16") };
+    let error = Store::from_env("bad/key", &nothing).unwrap_err();
+    assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
     // SAFETY: As above.
     unsafe { env::remove_var("NOTIFY_SOCKET") };
-    assert!(Store::from_env(KEY).unwrap().is_none());
+    let error = Store::from_env(KEY, &nothing).unwrap_err();
+    assert!(matches!(error, Error::NoManager), "{error:?}");
+}
+
+/// What systemd passed, as these names: each is a pipe.
+fn passed(names: &[&str]) -> Passed {
+    Passed::new(
+        names
+            .iter()
+            .map(|name| (name.to_string(), pipe().1))
+            .collect(),
+    )
 }
 
 /// A store of the manager, under `KEY`, that takes as many file descriptors as the store of the
 /// manager does.
 fn store(manager: &Manager) -> Store {
-    Store::new(manager.notifier().unwrap(), KEY, Some(manager.store_max())).unwrap()
+    testing::store(manager.notify_socket(), KEY, manager.store_max()).unwrap()
 }
 
 /// What the manager passes the next instance, taken over.
@@ -447,7 +619,7 @@ impl Save for Item {
         Some(self.bytes.len())
     }
 
-    fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, dest: &mut [u8]) -> Result<()> {
         dest.copy_from_slice(&self.bytes);
 
         Ok(())
@@ -466,7 +638,7 @@ impl Save for Unsaved {
         None
     }
 
-    fn save(&self, _dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, _dest: &mut [u8]) -> Result<()> {
         unreachable!("an item that can't be saved was saved")
     }
 
@@ -483,10 +655,10 @@ impl Save for Failing {
         Some(8)
     }
 
-    fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, dest: &mut [u8]) -> Result<()> {
         dest[0] = 1;
 
-        Err(io::Error::other("the record failed"))
+        Err(io::Error::other("the record failed").into())
     }
 
     fn fds(&self) -> Vec<BorrowedFd<'_>> {

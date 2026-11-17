@@ -10,14 +10,13 @@
 #[macro_use]
 mod log;
 
-mod handover;
-pub use handover::{Handover, Stored};
+mod error;
+pub use error::{Error, Result};
 mod layout;
 mod limit;
 pub use limit::raise_fd_limit;
 mod memfd;
 mod notifier;
-pub use notifier::Notifier;
 mod passed;
 pub use passed::Passed;
 mod queue;
@@ -26,7 +25,7 @@ pub use restored::{Restored, RestoredItem};
 mod save;
 pub use save::{Restore, Save};
 mod store;
-pub use store::Store;
+pub use store::{Store, Stored};
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 

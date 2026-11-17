@@ -1,9 +1,10 @@
-//! The notification socket of the service manager: [`Notifier`].
+//! The notification socket of the service manager, which a [`Store`](crate::Store) keeps to itself:
+//! [`Notifier`].
 
 use std::{
     env,
     ffi::OsStr,
-    io::{self, ErrorKind, IoSlice},
+    io::IoSlice,
     mem::MaybeUninit,
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
@@ -23,6 +24,8 @@ use rustix::{
     pipe::{PipeFlags, pipe_with},
 };
 
+use crate::{Error, Result};
+
 /// The notification socket of the service manager, `$NOTIFY_SOCKET`, as `sd_notify(3)` has it.
 ///
 /// A service sends it its state, such as `READY=1`, and the file descriptors that it wants the
@@ -35,7 +38,7 @@ use rustix::{
 /// manager is far behind, but it doesn't wait for the manager to read the message. The manager
 /// says nothing back, so [`barrier`](Self::barrier) is how to tell that it got to the messages.
 #[derive(Debug)]
-pub struct Notifier {
+pub(crate) struct Notifier {
     socket: OwnedFd,
     address: SocketAddrUnix,
 }
@@ -43,9 +46,10 @@ pub struct Notifier {
 impl Notifier {
     /// The one that `$NOTIFY_SOCKET` names, if it's set and not empty.
     ///
-    /// systemd sets it for the services that take notifications, so `None` means that this isn't
-    /// one, or isn't a service of systemd at all. It leaves the variable in the environment.
-    pub fn from_env() -> io::Result<Option<Self>> {
+    /// systemd sets it for the services that take notifications. So `None` means that this
+    /// service doesn't take them, or isn't a systemd service at all. This leaves the variable in
+    /// the environment. It fails in the same cases as [`new`](Self::new).
+    pub(crate) fn from_env() -> Result<Option<Self>> {
         match env::var_os("NOTIFY_SOCKET") {
             Some(address) if !address.is_empty() => Self::new(address).map(Some),
             _ => Ok(None),
@@ -54,29 +58,26 @@ impl Notifier {
 
     /// The one at `address`, in the form of `$NOTIFY_SOCKET`.
     ///
-    /// That is the path of a socket if `address` starts with a `/`, and the name of an abstract
-    /// socket after an `@` if it starts with that. A `/` or an `@` alone names nothing, which
-    /// fails with [`ErrorKind::InvalidInput`]. systemd also has `vsock:` addresses, by which a
-    /// virtual machine tells its host that it has booted: they fail with
-    /// [`ErrorKind::Unsupported`], as does anything else that is neither of the two.
-    pub fn new(address: impl AsRef<OsStr>) -> io::Result<Self> {
+    /// If `address` starts with a `/`, it is the path of a socket. If it starts with an `@`, the
+    /// rest is the name of an abstract socket. A `/` or an `@` alone names nothing, and fails with
+    /// [`Error::Environment`]. systemd also has `vsock:` addresses, which a virtual machine uses to
+    /// tell its host that it has booted. zoter doesn't support them: they fail with
+    /// [`Error::Environment`] too, like any other address that is neither a path nor an abstract
+    /// name. A name too long for a socket address fails with [`Error::Io`] of `ENAMETOOLONG`.
+    pub(crate) fn new(address: impl AsRef<OsStr>) -> Result<Self> {
         let address = match address.as_ref().as_bytes() {
             [b'/' | b'@'] => {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "the notification socket has no name",
+                return Err(Error::Environment(
+                    "the notification socket has no name".to_owned(),
                 ));
             }
-            path @ [b'/', ..] => SocketAddrUnix::new(path)?,
-            [b'@', name @ ..] => SocketAddrUnix::new_abstract_name(name)?,
+            path @ [b'/', ..] => SocketAddrUnix::new(path).map_err(Error::os)?,
+            [b'@', name @ ..] => SocketAddrUnix::new_abstract_name(name).map_err(Error::os)?,
             other => {
-                return Err(io::Error::new(
-                    ErrorKind::Unsupported,
-                    format!(
-                        "the notification socket `{}` is neither a path nor an abstract name",
-                        String::from_utf8_lossy(other),
-                    ),
-                ));
+                return Err(Error::Environment(format!(
+                    "the notification socket `{}` is neither a path nor an abstract name",
+                    String::from_utf8_lossy(other),
+                )));
             }
         };
         let socket = socket_with(
@@ -84,17 +85,10 @@ impl Notifier {
             SocketType::DGRAM,
             SocketFlags::CLOEXEC,
             None,
-        )?;
+        )
+        .map_err(Error::os)?;
 
         Ok(Self { socket, address })
-    }
-
-    /// Another notifier of the same manager, with a socket of its own.
-    pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            socket: self.socket.try_clone()?,
-            address: self.address.clone(),
-        })
     }
 
     /// Store `fds` in the store under `name`.
@@ -113,12 +107,13 @@ impl Notifier {
     /// message can't be sent, as the manager says nothing of what it did with it.
     /// [`barrier`](Self::barrier) tells that it has dealt with it.
     ///
-    /// A name is no longer than 255 characters, all of them printable ASCII ones but `:`, as
-    /// systemd ignores a name that isn't, and stores the file descriptors with none instead, as
-    /// `stored`. This refuses an empty name as well, which systemd takes, but which is likelier a
-    /// mistake than a name. A message has one name for all of its file descriptors, so those that
-    /// need names of their own take a call each.
-    pub fn store(&self, name: &str, fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+    /// A name is at most 255 characters long, and each character is printable ASCII other than
+    /// `:`. systemd ignores any other name, and stores the file descriptors without a name, as
+    /// `stored`. This method fails with [`Error::InvalidName`] for such a name. It also fails with
+    /// it for an empty name: systemd accepts one, but it is more likely a mistake than a real name.
+    /// A message has one name for all of its file descriptors, so file descriptors that need
+    /// different names need one call each.
+    pub(crate) fn store(&self, name: &str, fds: &[BorrowedFd<'_>]) -> Result<()> {
         check_name(name)?;
 
         self.notify_with_fds(&format!("FDSTORE=1\nFDPOLL=0\nFDNAME={name}"), fds)
@@ -130,7 +125,7 @@ impl Notifier {
     /// process lets go of a socket that it stored: while the manager has a copy of it, the peer of
     /// a connection doesn't see the connection end when the process closes its own. The name has to
     /// be a valid one, as for [`store`](Self::store).
-    pub fn remove(&self, name: &str) -> io::Result<()> {
+    pub(crate) fn remove(&self, name: &str) -> Result<()> {
         check_name(name)?;
 
         self.notify(&format!("FDSTOREREMOVE=1\nFDNAME={name}"))
@@ -141,7 +136,7 @@ impl Notifier {
     /// `state` is a list of assignments such as `READY=1`, each on a line of its own. The manager
     /// takes a message of 4096 bytes at most, and ignores a longer one, as well as one that it
     /// can't make sense of, so this only fails if the message can't be sent.
-    pub fn notify(&self, state: &str) -> io::Result<()> {
+    pub(crate) fn notify(&self, state: &str) -> Result<()> {
         self.notify_with_fds(state, &[])
     }
 
@@ -155,14 +150,14 @@ impl Notifier {
     /// A process needs this before it exits, as the manager may otherwise fail to tie its messages
     /// to the service, once the process is gone.
     ///
-    /// It fails with [`ErrorKind::TimedOut`] if the manager takes longer than `timeout`. It blocks
-    /// the thread meanwhile.
-    pub fn barrier(&self, timeout: Duration) -> io::Result<()> {
+    /// It fails with [`Error::TimedOut`] if the manager takes longer than `timeout`. It blocks the
+    /// thread while it waits.
+    pub(crate) fn barrier(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now().checked_add(timeout);
         // The manager has the only other copy of the write end once this sends it, and closes it
         // once it gets to the message, which hangs up the read end.
         let read = {
-            let (read, write) = pipe_with(PipeFlags::CLOEXEC)?;
+            let (read, write) = pipe_with(PipeFlags::CLOEXEC).map_err(Error::os)?;
             self.notify_with_fds("BARRIER=1", &[write.as_fd()])?;
 
             read
@@ -170,24 +165,21 @@ impl Notifier {
 
         // A hang-up is reported whether `poll` is asked for it or not.
         let mut fds = [PollFd::new(&read, PollFlags::empty())];
-        match retry_on_intr(|| poll(&mut fds, remaining(deadline).as_ref()))? {
-            0 => Err(io::Error::new(
-                ErrorKind::TimedOut,
-                "the service manager didn't process the notifications in time",
-            )),
+        match retry_on_intr(|| poll(&mut fds, remaining(deadline).as_ref())).map_err(Error::os)? {
+            0 => Err(Error::TimedOut),
             _ => Ok(()),
         }
     }
 
     /// Send `state`, as [`notify`](Self::notify) does, and `fds` along with it.
     ///
-    /// The manager closes the file descriptors that come with a message unless the message stores
-    /// them, as [`store`](Self::store) does. No more than 253 file descriptors fit in a message,
-    /// which is as many as Linux passes at once: more fail with `E2BIG`, without a message being
-    /// sent.
-    pub fn notify_with_fds(&self, state: &str, fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+    /// The manager closes the file descriptors that come with a message, unless the message stores
+    /// them. [`store`](Self::store) sends such messages. A message holds at most 253 file
+    /// descriptors, the most that Linux passes at once. More fail with [`Error::Io`] of `E2BIG`,
+    /// and no message is sent.
+    fn notify_with_fds(&self, state: &str, fds: &[BorrowedFd<'_>]) -> Result<()> {
         if fds.len() > MAX_FDS {
-            return Err(Errno::TOOBIG.into());
+            return Err(Error::os(Errno::TOOBIG));
         }
 
         let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_FDS))];
@@ -207,7 +199,8 @@ impl Notifier {
             &state,
             &mut control,
             SendFlags::NOSIGNAL,
-        )?;
+        )
+        .map_err(Error::os)?;
 
         Ok(())
     }
@@ -216,16 +209,13 @@ impl Notifier {
 /// Check that `name` is one that systemd takes for a stored file descriptor, and not empty.
 ///
 /// A newline isn't printable, so a name can't add assignments of its own to the message.
-pub(crate) fn check_name(name: &str) -> io::Result<()> {
+pub(crate) fn check_name(name: &str) -> Result<()> {
     let printable = |b: u8| (b' '..=b'~').contains(&b) && b != b':';
     if name.is_empty() || name.len() > MAX_NAME_LEN || !name.bytes().all(printable) {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "a file descriptor name is 1 to {MAX_NAME_LEN} printable ASCII characters, \
-                 other than `:`"
-            ),
-        ));
+        return Err(Error::InvalidName(format!(
+            "a file descriptor name is 1 to {MAX_NAME_LEN} printable ASCII characters, other \
+             than `:`"
+        )));
     }
 
     Ok(())
@@ -289,10 +279,10 @@ mod tests {
             &too_long,
         ];
         for name in invalid {
-            assert_eq!(
-                check_name(name).unwrap_err().kind(),
-                ErrorKind::InvalidInput,
-                "{name:?}"
+            let error = check_name(name).unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidName(_)),
+                "{name:?}: {error:?}"
             );
         }
     }
@@ -346,9 +336,9 @@ mod tests {
             let (_read, write) = pipe();
 
             let error = notifier.store("a:b", &[write.as_fd()]).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
             let error = notifier.remove("").unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
 
             // If either had been sent, the manager would get it before this.
             notifier.notify("READY=1").unwrap();
@@ -370,7 +360,7 @@ mod tests {
             let error = notifier
                 .notify_with_fds("READY=1", &[fd; MAX_FDS + 1])
                 .unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(Errno::TOOBIG.raw_os_error()));
+            assert_eq!(os_error(error), Errno::TOOBIG);
             // The manager gets nothing of it: the next message is this one.
             notifier.notify("STATUS=Next").unwrap();
             assert_eq!(manager.receive().0, "STATUS=Next");
@@ -382,20 +372,9 @@ mod tests {
         let notifier = Notifier::new(unique_path()).unwrap();
 
         let error = notifier.notify("READY=1").unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert_eq!(os_error(error), Errno::NOENT);
         let error = notifier.barrier(Duration::from_secs(1)).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::NotFound);
-    }
-
-    #[test]
-    fn clones_reach_the_same_manager() {
-        for (manager, notifier) in managers() {
-            let clone = notifier.try_clone().unwrap();
-            drop(notifier);
-
-            clone.notify("READY=1").unwrap();
-            assert_eq!(manager.receive().0, "READY=1");
-        }
+        assert_eq!(os_error(error), Errno::NOENT);
     }
 
     #[test]
@@ -410,7 +389,10 @@ mod tests {
 
         for address in ["/", "@"] {
             let error = Notifier::new(address).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidInput, "{address:?}");
+            assert!(
+                matches!(error, Error::Environment(_)),
+                "{address:?}: {error:?}"
+            );
         }
         for address in [
             "",
@@ -421,18 +403,17 @@ mod tests {
             "vsock-stream:2:1234",
         ] {
             let error = Notifier::new(address).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Unsupported, "{address:?}");
+            assert!(
+                matches!(error, Error::Environment(_)),
+                "{address:?}: {error:?}"
+            );
         }
         for address in [
             format!("/{}", "a".repeat(108)),
             format!("@{}", "a".repeat(108)),
         ] {
             let error = Notifier::new(&address).unwrap_err();
-            assert_eq!(
-                error.raw_os_error(),
-                Some(Errno::NAMETOOLONG.raw_os_error()),
-                "{address:?}"
-            );
+            assert_eq!(os_error(error), Errno::NAMETOOLONG, "{address:?}");
         }
     }
 
@@ -458,7 +439,7 @@ mod tests {
         // SAFETY: As above.
         unsafe { env::set_var("NOTIFY_SOCKET", "vsock:2:1234") };
         let error = Notifier::from_env().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(matches!(error, Error::Environment(_)), "{error:?}");
     }
 
     #[test]
@@ -494,12 +475,21 @@ mod tests {
             let timeout = Duration::from_millis(200);
             let start = Instant::now();
             let error = notifier.barrier(timeout).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::TimedOut);
+            assert!(matches!(error, Error::TimedOut), "{error:?}");
             assert!(start.elapsed() >= timeout, "{:?}", start.elapsed());
 
             release.send(()).unwrap();
             assert_eq!(manager.join().unwrap(), ("BARRIER=1".to_owned(), 1));
         }
+    }
+
+    /// The system error that `error` wraps.
+    fn os_error(error: Error) -> Errno {
+        let Error::Io(error) = error else {
+            panic!("{error:?} isn't an error of the system");
+        };
+
+        Errno::from_io_error(&error).unwrap_or_else(|| panic!("{error:?}"))
     }
 
     /// A manager at a socket file, and another at an abstract socket, with a notifier for each.

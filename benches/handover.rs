@@ -7,17 +7,17 @@
 //! instances are this process, one after the other, and the clients keep their ends of the sockets
 //! open throughout.
 //!
-//! - `store/100-clients`, `store/1000-clients`: `Handover::store` of the state of the service, 64
+//! - `store/100-clients`, `store/1000-clients`: `Store::hand_over` of the state of the service, 64
 //!   bytes for each client, and of an item for each, with a record of 256 bytes, from the start of
-//!   storing until the manager dealt with what was stored, which `store` waits for.
+//!   storing until the manager dealt with what was stored, which `hand_over` waits for.
 //! - `take-over/100-clients`, `take-over/1000-clients`: `Store::take_over` of such a hand-over, out
 //!   of what the manager passes the next instance, and the restoring of each item, its record and
 //!   its socket.
 //!
 //! What a round needs besides, which the service doesn't do as it hands over or takes over, is done
-//! between the rounds, untimed: creating the store of an instance, starting a hand-over, which only
-//! checks the store, the manager passing the next instance what is stored, and closing what was
-//! taken over. The rounds check, untimed, that every item was stored and taken over.
+//! between the rounds, untimed: creating the store of an instance, the manager passing the next
+//! instance what is stored, and closing what was taken over. The rounds check, untimed, that every
+//! item was stored and taken over.
 
 #[cfg(target_os = "linux")]
 criterion::criterion_main!(linux::benches);
@@ -29,7 +29,6 @@ fn main() {}
 #[cfg(target_os = "linux")]
 mod linux {
     use std::{
-        io,
         os::{
             fd::{AsFd, BorrowedFd, OwnedFd},
             unix::net::UnixStream,
@@ -38,7 +37,10 @@ mod linux {
     };
 
     use criterion::{Criterion, criterion_group};
-    use zoter::{Restore, Save, Store, Stored, testing::Manager};
+    use zoter::{
+        Restore, Save, Store, Stored,
+        testing::{self, Manager},
+    };
 
     criterion_group!(benches, stores, take_overs);
 
@@ -103,13 +105,10 @@ mod linux {
         /// How long storing a hand-over of the service takes, from the start of storing until the
         /// manager dealt with what was stored.
         fn time_store(&self) -> Duration {
-            let handover = self
-                .store()
-                .handover()
-                .expect("the store takes a hand-over");
+            let store = self.store();
             let start = Instant::now();
-            let stored = handover
-                .store(&self.state[..], self.items())
+            let stored = store
+                .hand_over(&self.state[..], self.items())
                 .expect("the hand-over is stored");
             let time = start.elapsed();
             self.check(&stored);
@@ -121,12 +120,9 @@ mod linux {
 
         /// How long taking a hand-over of the service over takes, and restoring its items.
         fn time_take_over(&self) -> Duration {
-            let handover = self
+            let stored = self
                 .store()
-                .handover()
-                .expect("the store takes a hand-over");
-            let stored = handover
-                .store(&self.state[..], self.items())
+                .hand_over(&self.state[..], self.items())
                 .expect("the hand-over is stored");
             self.check(&stored);
             let mut passed = self.manager.passed().expect("the manager passes the store");
@@ -145,8 +141,7 @@ mod linux {
             assert_eq!(connections.len(), self.connections.len());
             // The manager removes what was taken over from its store before the next round stores
             // into it, as it keeps no more than its store takes.
-            store
-                .notifier()
+            self.manager
                 .barrier(WAIT)
                 .expect("the manager removes what was taken over");
 
@@ -155,9 +150,8 @@ mod linux {
 
         /// The store of an instance of the service, as the instance creates it as it starts.
         fn store(&self) -> Store {
-            let notifier = self.manager.notifier().expect("a notifier of the manager");
-
-            Store::new(notifier, KEY, Some(self.manager.store_max())).expect("a store")
+            testing::store(self.manager.notify_socket(), KEY, self.manager.store_max())
+                .expect("a store")
         }
 
         /// The items of a hand-over of the service: its connections, under the numbers of their
@@ -185,7 +179,7 @@ mod linux {
             Some(self.record.len())
         }
 
-        fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+        fn save(&self, dest: &mut [u8]) -> zoter::Result<()> {
             dest.copy_from_slice(&self.record);
 
             Ok(())
@@ -197,11 +191,11 @@ mod linux {
     }
 
     impl Restore for Connection {
-        type Error = io::Error;
+        type Error = zoter::Error;
 
-        fn restore(record: &[u8], fds: Vec<OwnedFd>) -> io::Result<Self> {
+        fn restore(record: &[u8], fds: Vec<OwnedFd>) -> zoter::Result<Self> {
             let [socket] = <[OwnedFd; 1]>::try_from(fds).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "a connection has one socket")
+                zoter::Error::InvalidHandover("a connection has one socket".to_owned())
             })?;
 
             Ok(Self {

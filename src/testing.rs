@@ -1,4 +1,5 @@
-//! A fake service manager, for the tests of the restarts of services: [`Manager`].
+//! What the tests of the restarts of services need: [`Manager`], a fake service manager, and
+//! [`store`], the store of a service that a test runs in its own process.
 //!
 //! This is behind the `testing` cargo feature.
 
@@ -31,8 +32,8 @@ use rustix::{
 };
 
 use crate::{
-    Notifier, Passed,
-    notifier::MAX_FDS,
+    Error, Passed, Result, Store,
+    notifier::{MAX_FDS, Notifier},
     passed::START,
     queue::{self, Queue},
 };
@@ -51,8 +52,9 @@ use crate::{
 /// [`command`](Self::command) starts a service as systemd starts one, with the sockets of socket
 /// activation that the test gives the manager ([`add_socket`](Self::add_socket)) and what is in
 /// the store, so that a test restarts a service by stopping it and starting it again. For a
-/// service that runs in the test process, [`notifier`](Self::notifier) and
-/// [`passed`](Self::passed) give what [`Notifier::from_env`] and [`Passed::from_env`] would.
+/// service that runs in the test process, [`store`] gives the store that [`Store::from_env`] would,
+/// out of [`notify_socket`](Self::notify_socket) and [`store_max`](Self::store_max), and
+/// [`passed`](Self::passed) gives what [`Passed::from_env`] would.
 pub struct Manager {
     /// The path of the notification socket.
     path: PathBuf,
@@ -66,7 +68,7 @@ pub struct Manager {
 impl Manager {
     /// A manager whose store takes 16 file descriptors, and that has no socket of socket
     /// activation yet.
-    pub fn new() -> io::Result<Self> {
+    pub fn new() -> Result<Self> {
         let path = env::temp_dir().join(unique_name());
         let socket = UnixDatagram::bind(&path)?;
         let shared = Arc::new(Shared {
@@ -87,7 +89,7 @@ impl Manager {
             Err(e) => {
                 let _ = remove_file(&path);
 
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -104,16 +106,10 @@ impl Manager {
         &self.path
     }
 
-    /// A notifier of this manager, as [`Notifier::from_env`] gives one to the services that it
-    /// starts.
-    pub fn notifier(&self) -> io::Result<Notifier> {
-        Notifier::new(&self.path)
-    }
-
     /// Have the store take `max` file descriptors, as `FileDescriptorStoreMax=` has systemd do.
     ///
-    /// The services that the manager starts from then on get it as `$FDSTORE`. What the store
-    /// keeps already stays.
+    /// The services that the manager starts from then on get it as `$FDSTORE`, or no `$FDSTORE` if
+    /// it is 0, as systemd keeps no store then. What the store keeps already stays.
     pub fn set_store_max(&mut self, max: usize) {
         self.shared.state().store_max = max;
     }
@@ -137,7 +133,7 @@ impl Manager {
     /// What systemd would pass a service that it starts now: duplicates of the sockets of socket
     /// activation, then of what is in the store, with their names, as [`Passed::from_env`] gives
     /// them.
-    pub fn passed(&self) -> io::Result<Passed> {
+    pub fn passed(&self) -> Result<Passed> {
         let state = self.shared.state();
         let fds = self
             .activation
@@ -154,10 +150,11 @@ impl Manager {
     /// Arguments added to the command go to `program`. It runs with what [`passed`](Self::passed)
     /// gives as its file descriptors from 3 on, with `$LISTEN_FDS`, `$LISTEN_FDNAMES` and
     /// `$LISTEN_PID` telling of them, and with `$NOTIFY_SOCKET` naming the socket of the manager,
-    /// and `$FDSTORE` telling how many file descriptors the store takes. A shell runs `program` as
-    /// itself, so that `$LISTEN_PID` is the PID of `program`, which can't be known before it
-    /// starts. The command keeps duplicates of the file descriptors to pass until it is dropped.
-    pub fn command(&self, program: impl AsRef<OsStr>) -> io::Result<Command> {
+    /// and `$FDSTORE` telling how many file descriptors the store takes, unless it takes none. A
+    /// shell runs `program` as itself, so that `$LISTEN_PID` is the PID of `program`, which can't
+    /// be known before it starts. The command keeps duplicates of the file descriptors to pass
+    /// until it is dropped.
+    pub fn command(&self, program: impl AsRef<OsStr>) -> Result<Command> {
         let passed = self.passed()?.into_vec();
         let count = passed.len();
         // The file descriptors may be among those they are to be passed as, so that passing one
@@ -171,7 +168,7 @@ impl Manager {
         let mut copies = Vec::with_capacity(count);
         for (name, fd) in passed {
             names.push(name);
-            copies.push(fcntl_dupfd_cloexec(&fd, first_free)?);
+            copies.push(fcntl_dupfd_cloexec(&fd, first_free).map_err(Error::os)?);
         }
         let sources: Vec<RawFd> = copies.iter().map(AsRawFd::as_raw_fd).collect();
 
@@ -189,9 +186,13 @@ impl Manager {
         ] {
             command.env_remove(var);
         }
-        command
-            .env("NOTIFY_SOCKET", &self.path)
-            .env("FDSTORE", self.store_max().to_string());
+        command.env("NOTIFY_SOCKET", &self.path);
+        // systemd tells of a store that takes file descriptors, and leaves the variable unset for
+        // a service without one.
+        match self.store_max() {
+            0 => command.env_remove("FDSTORE"),
+            max => command.env("FDSTORE", max.to_string()),
+        };
         if count > 0 {
             command
                 .env("LISTEN_FDS", count.to_string())
@@ -225,9 +226,11 @@ impl Manager {
     /// Wait, `timeout` at most, for a notification that has `state` as one of its lines, such as
     /// `READY=1`, and let go of those that came before it.
     ///
-    /// Each notification is waited for once: a second wait for `READY=1` waits for another one. It
-    /// fails with [`ErrorKind::TimedOut`] if none comes in time.
-    pub fn wait_for(&self, state: &str, timeout: Duration) -> io::Result<()> {
+    /// Each notification satisfies only one wait: a second wait for `READY=1` waits for another
+    /// one. It fails with [`Error::Io`] of [`ErrorKind::TimedOut`] if none comes in time. It does
+    /// not use [`Error::TimedOut`], because that error means that the manager is late, and here the
+    /// service is late.
+    pub fn wait_for(&self, state: &str, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.shared.state();
         loop {
@@ -241,7 +244,8 @@ impl Manager {
                 return Err(io::Error::new(
                     ErrorKind::TimedOut,
                     format!("no `{state}` came in time"),
-                ));
+                )
+                .into());
             }
             guard = self
                 .shared
@@ -252,12 +256,23 @@ impl Manager {
         }
     }
 
+    /// Wait, `timeout` at most, for the manager to have dealt with what the services sent it so
+    /// far.
+    ///
+    /// The manager deals with what it gets on a thread of its own, in the order that it came. So
+    /// what a service stored, removed or told it just before may not show yet, as in
+    /// [`stored_names`](Self::stored_names). This sends the manager a barrier of the test's own,
+    /// which shows among the notifications as `BARRIER=1`, and waits for the manager to get to
+    /// it. It fails with [`Error::TimedOut`] if the manager takes longer than `timeout`.
+    pub fn barrier(&self, timeout: Duration) -> Result<()> {
+        Notifier::new(&self.path)?.barrier(timeout)
+    }
+
     /// The text of each notification that came and that [`wait_for`](Self::wait_for) didn't let
     /// go of, oldest first, to wait for none of them again.
     ///
     /// The manager deals with the notifications on a thread of its own, so a notification sent
-    /// just before this may not be among them: a [`Notifier::barrier`] of the test is dealt with
-    /// once those that came before it are.
+    /// just before this may not be among them: [`barrier`](Self::barrier) waits for those.
     pub fn take_notifications(&self) -> Vec<String> {
         self.shared.state().notifications.drain(..).collect()
     }
@@ -270,7 +285,7 @@ impl Manager {
     }
 
     /// Duplicates of what is in the store, with their names, in the order that it was stored.
-    pub fn stored(&self) -> io::Result<Vec<(String, OwnedFd)>> {
+    pub fn stored(&self) -> Result<Vec<(String, OwnedFd)>> {
         let state = self.shared.state();
 
         state
@@ -282,12 +297,12 @@ impl Manager {
 
     /// How many file descriptors the hand-over under `key` holds in its queue sockets, those of its
     /// state included, in its items, as a service stored them with
-    /// [`Handover::store`](crate::Handover::store).
+    /// [`Store::hand_over`](crate::Store::hand_over).
     ///
     /// The queue sockets give their file descriptors up as they are read, so this takes them out
     /// and puts them back in queue sockets of its own, which take their places in the store. It
     /// fails as reading a queue does, as with a socket that no hand-over stored.
-    pub fn stored_fds(&self, key: &str) -> io::Result<usize> {
+    pub fn stored_fds(&self, key: &str) -> Result<usize> {
         let name = format!("{key}/fds");
         let mut state = self.shared.state();
         let mut count = 0;
@@ -298,7 +313,7 @@ impl Manager {
             for (index, fds) in &taken {
                 let fds: Vec<_> = fds.iter().map(AsFd::as_fd).collect();
                 if !refilled.push(*index, &fds)? {
-                    return Err(io::Error::other("a queue of the manager is full"));
+                    return Err(io::Error::other("a queue of the manager is full").into());
                 }
                 count += fds.len();
             }
@@ -348,6 +363,19 @@ impl Drop for Manager {
         }
         let _ = remove_file(&self.path);
     }
+}
+
+/// The store of a service whose manager takes notifications at `notify_socket`, under `key`,
+/// which takes `max` file descriptors: the one that [`Store::from_env`] gives a service whose
+/// `$NOTIFY_SOCKET` is `notify_socket` and whose `$FDSTORE` is `max`.
+///
+/// It is for a service that a test runs in its own process, where the environment tells nothing
+/// of the manager. The test gives it the [`notify_socket`](Manager::notify_socket) and the
+/// [`store_max`](Manager::store_max) of a [`Manager`], or those of a manager that it plays itself.
+///
+/// It fails as [`Store::from_env`] does for such a `$NOTIFY_SOCKET`, `$FDSTORE` and key.
+pub fn store(notify_socket: impl AsRef<OsStr>, key: &str, max: usize) -> Result<Store> {
+    Store::with_notifier(Notifier::new(notify_socket)?, key, max)
 }
 
 /// What the thread that serves the notification socket shares with the manager.
@@ -498,12 +526,15 @@ mod tests {
     use rustix::io::write;
 
     use super::*;
-    use crate::test_utils::{pipe, read_byte};
+    use crate::{
+        Error,
+        test_utils::{pipe, read_byte},
+    };
 
     #[test]
     fn store_and_remove() {
         let manager = Manager::new().unwrap();
-        let notifier = manager.notifier().unwrap();
+        let notifier = Notifier::new(manager.notify_socket()).unwrap();
         let (read, write_end) = pipe();
 
         notifier.store("a", &[write_end.as_fd()]).unwrap();
@@ -530,7 +561,7 @@ mod tests {
     fn store_takes_its_max() {
         let mut manager = Manager::new().unwrap();
         manager.set_store_max(2);
-        let notifier = manager.notifier().unwrap();
+        let notifier = Notifier::new(manager.notify_socket()).unwrap();
         let fds: Vec<_> = (0..3).map(|_| pipe().1).collect();
         let borrowed: Vec<_> = fds.iter().map(AsFd::as_fd).collect();
 
@@ -542,7 +573,7 @@ mod tests {
     #[test]
     fn wait_for_notifications() {
         let manager = Manager::new().unwrap();
-        let notifier = manager.notifier().unwrap();
+        let notifier = Notifier::new(manager.notify_socket()).unwrap();
 
         notifier.notify("STATUS=Starting").unwrap();
         notifier.notify("READY=1\nSTATUS=Up").unwrap();
@@ -551,10 +582,13 @@ mod tests {
         let error = manager
             .wait_for("READY=1", Duration::from_millis(100))
             .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(
+            matches!(&error, Error::Io(e) if e.kind() == ErrorKind::TimedOut),
+            "{error:?}"
+        );
 
         notifier.notify("STATUS=Down").unwrap();
-        notifier.barrier(WAIT).unwrap();
+        manager.barrier(WAIT).unwrap();
         assert_eq!(manager.take_notifications(), ["STATUS=Down", "BARRIER=1"]);
         assert!(manager.take_notifications().is_empty());
     }
@@ -562,7 +596,7 @@ mod tests {
     #[test]
     fn passed_as_systemd_passes_them() {
         let mut manager = Manager::new().unwrap();
-        let notifier = manager.notifier().unwrap();
+        let notifier = Notifier::new(manager.notify_socket()).unwrap();
         manager.add_socket("example.socket", pipe().1);
         notifier.store("stored", &[pipe().1.as_fd()]).unwrap();
         notifier.barrier(WAIT).unwrap();
@@ -578,15 +612,15 @@ mod tests {
     #[test]
     fn stored_fds() {
         let manager = Manager::new().unwrap();
-        let store = crate::Store::new(manager.notifier().unwrap(), "test", Some(2)).unwrap();
+        let store = super::store(manager.notify_socket(), "test", 2).unwrap();
         let items = [(1, Fds(vec![pipe().1])), (2, Fds(vec![pipe().1, pipe().1]))];
-        store.handover().unwrap().store(&[][..], items).unwrap();
+        store.hand_over(&[][..], items).unwrap();
 
         assert_eq!(manager.stored_fds("test").unwrap(), 3);
         assert_eq!(manager.stored_fds("test").unwrap(), 3);
         assert_eq!(manager.stored_fds("other").unwrap(), 0);
         let mut passed = manager.passed().unwrap();
-        let mut store = crate::Store::new(manager.notifier().unwrap(), "test", Some(2)).unwrap();
+        let mut store = super::store(manager.notify_socket(), "test", 2).unwrap();
         let mut restored = store.take_over(&mut passed).unwrap().unwrap();
         let fds: Vec<_> = restored.take_items().map(|item| item.fds.len()).collect();
         assert_eq!(fds, [1, 2]);
@@ -600,7 +634,7 @@ mod tests {
             Some(0)
         }
 
-        fn save(&self, _dest: &mut [u8]) -> io::Result<()> {
+        fn save(&self, _dest: &mut [u8]) -> Result<()> {
             Ok(())
         }
 
@@ -610,31 +644,33 @@ mod tests {
     }
 
     /// The service runs with its file descriptors from 3 on, and the variables that tell of them
-    /// and of the manager.
+    /// and of the manager. `$FDSTORE` is unset for a store that takes no file descriptors.
     #[test]
     fn command() {
         let mut manager = Manager::new().unwrap();
-        manager.set_store_max(4);
         manager.add_socket("first", pipe().1);
         manager.add_socket("second", pipe().1);
         let script = r#"
             test "$LISTEN_PID" = "$$" && test -e /proc/$$/fd/3 && test -e /proc/$$/fd/4 &&
-            echo "$LISTEN_FDS $LISTEN_FDNAMES $FDSTORE $NOTIFY_SOCKET $1"
+            echo "$LISTEN_FDS $LISTEN_FDNAMES ${FDSTORE-unset} $NOTIFY_SOCKET $1"
         "#;
 
-        let output = manager
-            .command("sh")
-            .unwrap()
-            .args(["-c", script, "sh", "arg"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let expected = format!(
-            "2 first:second 4 {} arg\n",
-            manager.notify_socket().display()
-        );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+        for (max, told) in [(4, "4"), (0, "unset")] {
+            manager.set_store_max(max);
+            let output = manager
+                .command("sh")
+                .unwrap()
+                .args(["-c", script, "sh", "arg"])
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let expected = format!(
+                "2 first:second {told} {} arg\n",
+                manager.notify_socket().display()
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+        }
     }
 
     const WAIT: Duration = Duration::from_secs(10);

@@ -2,30 +2,33 @@
 
 use std::{
     convert::Infallible,
-    io,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
 };
+
+use crate::{Error, Result};
 
 /// What can be handed over to the next instance of a service: a record of bytes, and the file
 /// descriptors that go with it.
 ///
 /// [`Restore`] gives it back from them, in the next instance. A protocol implements both for the
 /// hand-over of a connection, as zbus does for D-Bus, so that a service hands its connections over
-/// as they are, as items of a [`Handover`](crate::Handover).
+/// as they are, as items of its hand-over ([`Store::hand_over`](crate::Store::hand_over)).
 ///
 /// The trait takes no generics, and its methods return no `impl Trait`, so that the items of a
 /// hand-over can be of different types, as `dyn Save`.
 pub trait Save {
-    /// The exact length of the record, or `None` for what can't be saved, as the hand-over of a
-    /// connection that only goes on in this process: a hand-over of it fails.
+    /// The exact length of the record, or `None` for something that can't be saved, such as a
+    /// connection that only works in this process. A hand-over of it fails with
+    /// [`Error::Unsaved`].
     fn saved_len(&self) -> Option<usize>;
 
     /// Copy the record into `dest`, which is [`saved_len`](Self::saved_len) bytes long, and can be
     /// anywhere in memory, at any address, such as the place of the record in a memfd that is
     /// mapped into memory.
     ///
-    /// `dest` is zeroed. A record that fails to be saved fails the hand-over.
-    fn save(&self, dest: &mut [u8]) -> io::Result<()>;
+    /// `dest` is zeroed. If this fails, the hand-over fails with [`Error::Unsaved`], whose source
+    /// is the error that this returned.
+    fn save(&self, dest: &mut [u8]) -> Result<()>;
 
     /// The file descriptors that go with the record, in the order that [`Restore::restore`] takes
     /// them.
@@ -43,7 +46,7 @@ pub trait Restore: Sized {
     ///
     /// The record goes once this returns, as the next instance reads it in place, in the mapping of
     /// a memfd, so this copies what it needs out of it. Those of `fds` that it doesn't keep close.
-    fn restore(record: &[u8], fds: Vec<OwnedFd>) -> Result<Self, Self::Error>;
+    fn restore(record: &[u8], fds: Vec<OwnedFd>) -> std::result::Result<Self, Self::Error>;
 }
 
 /// A record of these bytes, with no file descriptors.
@@ -52,7 +55,7 @@ impl Save for [u8] {
         Some(self.len())
     }
 
-    fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, dest: &mut [u8]) -> Result<()> {
         dest.copy_from_slice(self);
 
         Ok(())
@@ -69,7 +72,7 @@ impl Save for Vec<u8> {
         self.as_slice().saved_len()
     }
 
-    fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, dest: &mut [u8]) -> Result<()> {
         self.as_slice().save(dest)
     }
 
@@ -84,7 +87,7 @@ impl Save for OwnedFd {
         Some(0)
     }
 
-    fn save(&self, _dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, _dest: &mut [u8]) -> Result<()> {
         Ok(())
     }
 
@@ -99,7 +102,7 @@ impl Save for BorrowedFd<'_> {
         Some(0)
     }
 
-    fn save(&self, _dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, _dest: &mut [u8]) -> Result<()> {
         Ok(())
     }
 
@@ -116,7 +119,7 @@ where
         (**self).saved_len()
     }
 
-    fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, dest: &mut [u8]) -> Result<()> {
         (**self).save(dest)
     }
 
@@ -133,7 +136,7 @@ where
         (**self).saved_len()
     }
 
-    fn save(&self, dest: &mut [u8]) -> io::Result<()> {
+    fn save(&self, dest: &mut [u8]) -> Result<()> {
         (**self).save(dest)
     }
 
@@ -144,19 +147,16 @@ where
 
 /// The bytes of a record that has no file descriptors.
 ///
-/// It fails with [`io::ErrorKind::InvalidData`] if there are any, and closes them.
+/// It fails with [`Error::InvalidHandover`] if any file descriptors came, and closes them.
 impl Restore for Vec<u8> {
-    type Error = io::Error;
+    type Error = Error;
 
-    fn restore(record: &[u8], fds: Vec<OwnedFd>) -> io::Result<Self> {
+    fn restore(record: &[u8], fds: Vec<OwnedFd>) -> Result<Self> {
         if !fds.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "a record of bytes alone came with {} file descriptors",
-                    fds.len()
-                ),
-            ));
+            return Err(Error::InvalidHandover(format!(
+                "a record of bytes alone came with {} file descriptors",
+                fds.len()
+            )));
         }
 
         Ok(record.to_vec())
@@ -165,22 +165,20 @@ impl Restore for Vec<u8> {
 
 /// The file descriptor of an empty record.
 ///
-/// It fails with [`io::ErrorKind::InvalidData`] for a record that isn't empty, or with other than
-/// one file descriptor, and closes those that came.
+/// It fails with [`Error::InvalidHandover`] if the record isn't empty, or if the number of file
+/// descriptors isn't exactly one. In both cases it closes the file descriptors that came.
 impl Restore for OwnedFd {
-    type Error = io::Error;
+    type Error = Error;
 
-    fn restore(record: &[u8], fds: Vec<OwnedFd>) -> io::Result<Self> {
+    fn restore(record: &[u8], fds: Vec<OwnedFd>) -> Result<Self> {
         let Ok([fd]) = <[OwnedFd; 1]>::try_from(fds) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a file descriptor came with other than one",
+            return Err(Error::InvalidHandover(
+                "a file descriptor came with other than one".to_owned(),
             ));
         };
         if !record.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a file descriptor came with a record",
+            return Err(Error::InvalidHandover(
+                "a file descriptor came with a record".to_owned(),
             ));
         }
 
@@ -192,7 +190,7 @@ impl Restore for OwnedFd {
 impl Restore for (Vec<u8>, Vec<OwnedFd>) {
     type Error = Infallible;
 
-    fn restore(record: &[u8], fds: Vec<OwnedFd>) -> Result<Self, Infallible> {
+    fn restore(record: &[u8], fds: Vec<OwnedFd>) -> std::result::Result<Self, Infallible> {
         Ok((record.to_vec(), fds))
     }
 }
@@ -215,7 +213,7 @@ mod tests {
         assert_eq!(Vec::<u8>::restore(&dest, Vec::new()).unwrap(), bytes);
         let (_, write) = pipe();
         let error = Vec::<u8>::restore(&dest, vec![write]).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
     }
 
     #[test]
@@ -229,11 +227,11 @@ mod tests {
 
         let restored = OwnedFd::restore(&[], vec![write]).unwrap();
         let error = OwnedFd::restore(b"x", vec![restored]).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
         let error = OwnedFd::restore(&[], Vec::new()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
         let error = OwnedFd::restore(&[], vec![read, pipe().1]).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(error, Error::InvalidHandover(_)), "{error:?}");
     }
 
     /// Items of different types go together, as `dyn Save`, whether borrowed or owned.

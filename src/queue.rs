@@ -2,7 +2,7 @@
 //! the store as one.
 
 use std::{
-    io::{self, ErrorKind, IoSlice, IoSliceMut},
+    io::{self, IoSlice, IoSliceMut},
     mem::MaybeUninit,
     os::fd::{BorrowedFd, OwnedFd},
 };
@@ -17,7 +17,7 @@ use rustix::{
     },
 };
 
-use crate::notifier::MAX_FDS;
+use crate::{Error, Result, notifier::MAX_FDS};
 
 /// A unix socket that holds file descriptors in its queue, and so takes any number of them through
 /// the store as one: [`push`](Self::push) them into it, store the socket that
@@ -115,9 +115,10 @@ impl Queue {
 /// can't have, as when it has as many open as its limit of open files takes, or a security module
 /// denies it one, and gives those before them alone. They are close-on-exec.
 ///
-/// It ends where the queue does, and fails on a datagram that no [`Queue`] pushed: its file
-/// descriptors close then, and those after it stay in the queue, to close with the socket.
-pub(crate) fn take<F>(socket: BorrowedFd<'_>, mut each: F) -> io::Result<()>
+/// It stops at the end of the queue. It fails with [`Error::InvalidHandover`] on a datagram that no
+/// [`Queue`] pushed. The file descriptors of that datagram are closed, and those after it stay in
+/// the queue and are closed with the socket.
+pub(crate) fn take<F>(socket: BorrowedFd<'_>, mut each: F) -> Result<()>
 where
     F: FnMut(u64, Vec<OwnedFd>, bool),
 {
@@ -138,7 +139,7 @@ where
             // The end that the file descriptors were pushed into is open still, somewhere, and
             // nothing more is queued.
             Err(Errno::AGAIN) => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(Error::os(e)),
         };
         // Past the last datagram, as the end that they were pushed into is closed: every datagram
         // that a queue pushed has an index.
@@ -146,9 +147,8 @@ where
             return Ok(());
         }
         if received.bytes != INDEX_LEN || received.flags.contains(ReturnFlags::TRUNC) {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "a datagram that no queue of file descriptors pushed",
+            return Err(Error::InvalidHandover(
+                "a datagram that no queue of file descriptors pushed".to_owned(),
             ));
         }
         let fds = control
@@ -307,11 +307,10 @@ mod tests {
                 datagram.len()
             );
 
-            let error = take(socket.as_fd(), |index, _, _| panic!("{index} came"));
-            assert_eq!(
-                error.unwrap_err().kind(),
-                ErrorKind::InvalidData,
-                "{datagram:?}"
+            let error = take(socket.as_fd(), |index, _, _| panic!("{index} came")).unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidHandover(_)),
+                "{datagram:?}: {error:?}"
             );
         }
     }

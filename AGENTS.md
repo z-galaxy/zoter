@@ -57,30 +57,36 @@ manager, which CodSpeed's simulation of the CPU leaves out.
 ```
 src/
 ├── lib.rs         # Re-exports the API below; the README is the crate docs
+├── error.rs       # Error and Result, the error type of the API; Error converts to io::Error
 ├── log.rs         # warn!/debug! through `tracing`, or nothing without the feature
 ├── save.rs        # Save and Restore: what an item of a hand-over is, a record and FDs
 ├── passed.rs      # Passed: the FDs that systemd passes, as sd_listen_fds(3) takes them
-├── notifier.rs    # Notifier: $NOTIFY_SOCKET, as sd_notify(3) has it, storing FDs and barriers
+├── notifier.rs    # Notifier, private: $NOTIFY_SOCKET, as sd_notify(3) has it, storing FDs,
+│                  # barriers
 ├── limit.rs       # raise_fd_limit
-├── handover.rs    # Handover: a hand-over that a store started; Stored: what went
-├── store.rs       # Store: handover, take_over and storing, queueing the FDs, the reserved FDs
+├── store.rs       # Store: take_over and hand_over, queueing the FDs, the reserved FDs;
+│                  # Stored: what a hand-over stored
 ├── store/tests.rs # Its tests, against testing::Manager in the test process
 ├── restored.rs    # Restored and RestoredItem: what was handed over, read in place
 ├── layout.rs      # The format of the memfd: header, table of the items, records
 ├── memfd.rs       # Sealed memfds, written and read in place through mappings (the unsafe code)
 ├── queue.rs       # Sockets whose queues hold any number of FDs, as one FD of the store
-├── testing.rs     # [testing feature] Manager: a fake service manager for tests
+├── testing.rs     # [testing feature] Manager: a fake service manager for tests; store: the
+│                  # store of a service that a test runs in its own process
 └── test_utils.rs  # What the unit tests share, such as running a test in a process of its own
 tests/restart.rs   # [testing feature] A restart end to end: the test binary is the service
 benches/handover.rs # [testing feature] What storing a hand-over and taking it over cost
 ```
 
-`Handover::store` lays a hand-over out in one memfd, stored under `<key>/state`, and puts the FDs
+`Store::hand_over` lays a hand-over out in one memfd, stored under `<key>/state`, and puts the FDs
 of the state and of the items in the queues of sockets, stored under `<key>/fds`, as many as that
 takes. `Store::take_over` takes the names of its key out of `Passed`, removes them from the store
-first, maps the memfd, and takes the FDs out of the queues by their indexes. The tests that take
-FDs from 3 on, change the environment or the limit of open FDs, or fork children that don't exec,
-run in a process of their own (`test_utils::in_own_process`).
+first, maps the memfd, and takes the FDs out of the queues by their indexes. Then it tells systemd
+that the service has started (`READY=1`), whatever came of that, so that no service has to. A
+`Store` is created only for a service that systemd passed a socket (`Error::NoSocket`), judged on
+what `Passed` was created with. The tests that take FDs from 3 on, change the environment or the
+limit of open FDs, or fork children that don't exec, run in a process of their own
+(`test_utils::in_own_process`).
 
 ## Development Guidelines
 

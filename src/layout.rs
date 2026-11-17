@@ -29,6 +29,8 @@ use std::{
     ops::Range,
 };
 
+use crate::{Error, Result};
+
 /// Where the parts of a hand-over go in its memfd.
 #[derive(Debug)]
 pub(crate) struct Layout {
@@ -160,20 +162,19 @@ pub(crate) struct Contents {
 
 /// What `memfd`, all of the bytes of the memfd of a hand-over, holds.
 ///
-/// It fails with `ErrorKind::Unsupported` for a memfd of a later major version of the format, or
-/// that needs a feature of it that this version of zoter doesn't know, and with
-/// `ErrorKind::InvalidData` for anything else that is no hand-over that [`Layout`] laid out.
-pub(crate) fn read(memfd: &[u8]) -> io::Result<Contents> {
+/// It fails with [`Error::UnsupportedHandover`] for a memfd in a later major version of the format,
+/// or one that needs a format feature that this version of zoter doesn't know. It fails with
+/// [`Error::InvalidHandover`] for anything else that isn't a hand-over laid out by [`Layout`].
+pub(crate) fn read(memfd: &[u8]) -> Result<Contents> {
     if memfd.get(..MAGIC.len()) != Some(MAGIC) {
         return Err(malformed());
     }
     match u16::from_le_bytes(field(memfd, 8)?) {
         MAJOR => (),
         major if major > MAJOR => {
-            return Err(io::Error::new(
-                ErrorKind::Unsupported,
-                format!("the hand-over is of version {major} of its format, later than {MAJOR}"),
-            ));
+            return Err(Error::UnsupportedHandover(format!(
+                "the hand-over is of version {major} of its format, later than {MAJOR}"
+            )));
         }
         _ => return Err(malformed()),
     }
@@ -182,9 +183,9 @@ pub(crate) fn read(memfd: &[u8]) -> io::Result<Contents> {
         return Err(malformed());
     }
     if u32::from_le_bytes(field(memfd, 12)?) & !KNOWN_FEATURES != 0 {
-        return Err(io::Error::new(
-            ErrorKind::Unsupported,
-            "the hand-over needs a feature of its format that this version of zoter doesn't know",
+        return Err(Error::UnsupportedHandover(
+            "the hand-over needs a feature of its format that this version of zoter doesn't know"
+                .to_owned(),
         ));
     }
     if number(memfd, 16)? != memfd.len() as u64 {
@@ -207,7 +208,7 @@ pub(crate) fn read(memfd: &[u8]) -> io::Result<Contents> {
         .as_chunks::<ENTRY_LEN>()
         .0
         .iter()
-        .map(|entry| -> io::Result<Entry> {
+        .map(|entry| -> Result<Entry> {
             let first = number(entry, 24)?;
             let end = first
                 .checked_add(number(entry, 32)?)
@@ -222,7 +223,7 @@ pub(crate) fn read(memfd: &[u8]) -> io::Result<Contents> {
                 fds: first..end,
             })
         })
-        .collect::<io::Result<_>>()?;
+        .collect::<Result<_>>()?;
 
     Ok(Contents {
         state,
@@ -244,7 +245,7 @@ impl Writer<'_> {
 }
 
 /// The `N` bytes of `bytes` at `at`.
-fn field<const N: usize>(bytes: &[u8], at: usize) -> io::Result<[u8; N]> {
+fn field<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N]> {
     let field = at
         .checked_add(N)
         .and_then(|end| bytes.get(at..end))
@@ -256,12 +257,12 @@ fn field<const N: usize>(bytes: &[u8], at: usize) -> io::Result<[u8; N]> {
 }
 
 /// The number of 8 bytes of `bytes` at `at`.
-fn number(bytes: &[u8], at: usize) -> io::Result<u64> {
+fn number(bytes: &[u8], at: usize) -> Result<u64> {
     field(bytes, at).map(u64::from_le_bytes)
 }
 
 /// Where the record at `offset`, of `len` bytes, is in `memfd`, if it is all there.
-fn record(memfd: &[u8], offset: u64, len: u64) -> io::Result<Range<usize>> {
+fn record(memfd: &[u8], offset: u64, len: u64) -> Result<Range<usize>> {
     let start = usize::try_from(offset).map_err(|_| malformed())?;
     let end = usize::try_from(len)
         .ok()
@@ -275,11 +276,8 @@ fn record(memfd: &[u8], offset: u64, len: u64) -> io::Result<Range<usize>> {
 }
 
 /// The error of a memfd that holds no hand-over that [`Layout`] laid out.
-fn malformed() -> io::Error {
-    io::Error::new(
-        ErrorKind::InvalidData,
-        "the memfd of the hand-over isn't one that zoter laid out",
-    )
+fn malformed() -> Error {
+    Error::InvalidHandover("the memfd of the hand-over isn't one that zoter laid out".to_owned())
 }
 
 /// The error of a hand-over too long for a memfd.
@@ -381,7 +379,11 @@ mod tests {
         for (at, bytes) in unsupported {
             let mut spoiled = memfd.clone();
             spoiled[at..at + bytes.len()].copy_from_slice(bytes);
-            assert_eq!(read(&spoiled).unwrap_err().kind(), ErrorKind::Unsupported);
+            let error = read(&spoiled).unwrap_err();
+            assert!(
+                matches!(error, Error::UnsupportedHandover(_)),
+                "at {at}: {error:?}"
+            );
         }
 
         let malformed: [(usize, &[u8]); 9] = [
@@ -407,7 +409,10 @@ mod tests {
             let mut spoiled = memfd.clone();
             spoiled[at..at + bytes.len()].copy_from_slice(bytes);
             let error = read(&spoiled).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidData, "at {at}: {error}");
+            assert!(
+                matches!(error, Error::InvalidHandover(_)),
+                "at {at}: {error:?}"
+            );
         }
         assert!(read(&memfd[..63]).is_err());
         assert!(read(b"").is_err());

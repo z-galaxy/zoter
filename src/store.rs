@@ -1,10 +1,9 @@
 //! The file descriptor store of a service, through which it hands over to its next instance:
-//! [`Store`].
+//! [`Store`], and what a hand-over stored: [`Stored`].
 
 use std::{
     collections::{BTreeSet, HashMap},
-    env,
-    io::{self, ErrorKind},
+    env, io,
     ops::Range,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     time::Duration,
@@ -16,10 +15,10 @@ use rustix::{
 };
 
 use crate::{
-    Handover, Notifier, Passed, Restored, Save, Stored,
+    Error, Passed, Restored, Result, Save,
     layout::{self, Entry, Layout},
     memfd,
-    notifier::MAX_FDS,
+    notifier::{MAX_FDS, Notifier},
     queue::{self, Queue},
     restored::Slot,
 };
@@ -29,14 +28,19 @@ use crate::{
 ///
 /// systemd keeps the store for the service across its restarts: what the service stores in it,
 /// systemd passes the next instance as it starts it, along with the sockets of socket activation.
-/// [`handover`](Self::handover) starts a [`Handover`], which stores what the service hands over as
-/// it stops, and [`take_over`](Self::take_over) gives it back in the next instance, under the same
-/// key, as a [`Restored`]. Several keys keep several hand-overs apart, in one store.
+/// [`hand_over`](Self::hand_over) stores what the service hands over as it stops: its state, and
+/// items, such as the connections of its clients, under ids of its own, each what [`Save`] saves,
+/// a record of bytes and file descriptors. [`take_over`](Self::take_over) gives it back in the
+/// next instance, under the same key, as a [`Restored`]. Several keys keep several hand-overs
+/// apart, in one store.
 ///
-/// The unit of the service needs `FileDescriptorStoreMax=` of 2 at least, for systemd to keep a
-/// store, and systemd 254 or later, which tells the service how many file descriptors the store
-/// takes, in `$FDSTORE`. A socket unit has systemd keep the socket that the service listens on,
-/// and the clients that connect meanwhile, while no instance runs.
+/// A service needs three things, without which there is no `Store`, as
+/// [`from_env`](Self::from_env) tells. It needs a socket unit, which has systemd keep the socket
+/// that the service listens on, and the clients that connect meanwhile, while no instance runs, and
+/// `Requires=` on it in the unit of the service, as systemd otherwise starts the service without
+/// the socket where the socket unit isn't active. It needs `FileDescriptorStoreMax=` of 2 at least,
+/// for systemd to keep a store. And it needs systemd 254 or later, which tells the service how many
+/// file descriptors the store takes, in `$FDSTORE`.
 ///
 /// # What the store holds
 ///
@@ -51,9 +55,9 @@ use crate::{
 ///
 /// # Limits
 ///
-/// A hand-over is stored whole, or [`Handover::store`] fails, and it is taken over whole, or
-/// [`take_over`](Self::take_over) fails: nothing of it is left out. The next instance takes the
-/// file descriptors out of the queues under its soft limit of open files, which
+/// A hand-over is stored whole, or [`hand_over`](Self::hand_over) fails, and it is taken over
+/// whole, or [`take_over`](Self::take_over) fails: nothing of it is left out. The next instance
+/// takes the file descriptors out of the queues under its soft limit of open files, which
 /// [`raise_fd_limit`](crate::raise_fd_limit) raises to the hard one, and fails to take over if
 /// they don't fit under it. The store keeps a few file descriptors open from its creation on, which
 /// it gives up for those that storing a hand-over opens, so that storing can't fail for want of
@@ -62,57 +66,58 @@ use crate::{
 pub struct Store {
     notifier: Notifier,
     key: String,
-    /// How many file descriptors the store takes, `$FDSTORE`.
-    max: Option<usize>,
+    /// How many file descriptors the store takes, `$FDSTORE`: [`MIN_STORE`] at least.
+    max: usize,
     /// The file descriptors kept to give up for those that storing opens.
     reserve: Option<Reserve>,
 }
 
 impl Store {
-    /// The store of the service that `$NOTIFY_SOCKET` names, taking as many file descriptors as
-    /// `$FDSTORE` tells, under `key`, if `$NOTIFY_SOCKET` is set.
+    /// The store that systemd keeps for the service, under `key`.
     ///
-    /// `None` means that systemd didn't start the service, or that the service takes no
-    /// notifications. It fails as [`Notifier::from_env`] and [`Store::new`] do.
-    pub fn from_env(key: &str) -> io::Result<Option<Self>> {
-        let Some(notifier) = Notifier::from_env()? else {
-            return Ok(None);
-        };
-
-        Self::new(notifier, key, fd_store_max()).map(Some)
-    }
-
-    /// The store of the service that `notifier` reaches, taking `max` file descriptors, as
-    /// `FileDescriptorStoreMax=` of the unit sets it, under `key`.
+    /// The service reaches it through the notification socket that `$NOTIFY_SOCKET` names, and it
+    /// takes as many file descriptors as `$FDSTORE` tells. systemd sets both for a service whose
+    /// unit has a `FileDescriptorStoreMax=` above 0, `$FDSTORE` from version 254 on.
     ///
-    /// The key is 1 to 200 printable ASCII characters, other than `:` and `/`: it fails with
-    /// [`ErrorKind::InvalidInput`] otherwise.
-    pub fn new(notifier: Notifier, key: &str, max: Option<usize>) -> io::Result<Self> {
-        check_key(key)?;
-        let reserve = match max {
-            Some(max) if max >= MIN_STORE => Reserve::new()
-                .inspect_err(|e| warn!("Failed to keep file descriptors to hand over with: {e}"))
-                .ok(),
-            _ => None,
-        };
+    /// `passed` is what systemd passed the service, as [`Passed::from_env`] takes it. The store is
+    /// only for a service that systemd passed a socket of socket activation, for the reason that
+    /// [`take_over`](Self::take_over) gives. What was taken out of `passed` before doesn't matter:
+    /// this goes by what `passed` was created with.
+    ///
+    /// The key is 1 to 200 printable ASCII characters other than `:` and `/`. For any other key,
+    /// this fails with [`Error::InvalidName`].
+    ///
+    /// It fails with [`Error::NoManager`] if `$NOTIFY_SOCKET` is unset or empty. systemd then
+    /// takes no notifications from the process, as when it doesn't run it at all, and keeps no
+    /// store for it. A service that also runs without systemd goes on without a store then.
+    ///
+    /// It fails with [`Error::NoStore`] if `$FDSTORE` is unset or not a number. systemd then takes
+    /// notifications from the service, as for a unit of `Type=notify`, but keeps no store for it,
+    /// or is older than 254. It fails with [`Error::StoreTooSmall`] if `$FDSTORE` is less than 2,
+    /// the fewest that a hand-over takes: the memfd and a queue socket.
+    ///
+    /// It fails with [`Error::NoSocket`] if systemd passed the service nothing but what is stored
+    /// under the key, if that. A file descriptor under any other name counts as a socket, even one
+    /// that is stored under another key, which this doesn't tell from a socket. The checks run in
+    /// the order above, so a service that lacks both a store and a socket is told of the store
+    /// first.
+    ///
+    /// `$NOTIFY_SOCKET` is the path of a socket if it starts with a `/`, and the name of an
+    /// abstract socket, after the `@`, if it starts with one. A `/` or an `@` alone names nothing,
+    /// and fails with [`Error::Environment`]. systemd also has `vsock:` addresses, which a virtual
+    /// machine uses to tell its host that it has booted. zoter doesn't support them: they fail
+    /// with [`Error::Environment`] too, like any other address that is neither a path nor an
+    /// abstract name. A name too long for a socket address fails with [`Error::Io`] of
+    /// `ENAMETOOLONG`.
+    pub fn from_env(key: &str, passed: &Passed) -> Result<Self> {
+        let notifier = Notifier::from_env()?.ok_or(Error::NoManager)?;
+        let max = fd_store_max().ok_or(Error::NoStore)?;
+        let store = Self::with_notifier(notifier, key, max)?;
+        if !passed.had_other_than(&format!("{key}/")) {
+            return Err(Error::NoSocket);
+        }
 
-        Ok(Self {
-            notifier,
-            key: key.to_owned(),
-            max,
-            reserve,
-        })
-    }
-
-    /// The notification socket of the service manager, for the service to tell it that it's
-    /// ready, among other things.
-    pub fn notifier(&self) -> &Notifier {
-        &self.notifier
-    }
-
-    /// How many file descriptors the store takes, if systemd keeps one.
-    pub fn max(&self) -> Option<usize> {
-        self.max
+        Ok(store)
     }
 
     /// Take over from the previous instance: take the file descriptors stored under the key out
@@ -124,16 +129,95 @@ impl Store {
     /// stored, close. What is left in `passed` is the sockets of socket activation, and what the
     /// service stored itself, if anything.
     ///
-    /// It gives `None` if nothing was handed over, and the hand-over whole otherwise, the state and
-    /// every item with all of their file descriptors. It fails with the system's error of too many
-    /// open files (`EMFILE`) if the file descriptors don't fit under the soft limit of open files
-    /// of the process, which [`raise_fd_limit`](crate::raise_fd_limit) raises, and the hard limit
-    /// of `LimitNOFILE=` of the service bounds. It fails with [`ErrorKind::InvalidData`] for a
-    /// hand-over that this version of zoter can't make sense of, file descriptors of the state or
-    /// of an item that are missing for any other reason included, and with
-    /// [`ErrorKind::Unsupported`] for one that a later version of zoter laid out otherwise. The
-    /// file descriptors of the hand-over close then, which disconnects the peers of the items.
-    pub fn take_over(&mut self, passed: &mut Passed) -> io::Result<Option<Restored>> {
+    /// It returns `None` if nothing was handed over. Otherwise it returns the whole hand-over: the
+    /// state and every item, with all of their file descriptors.
+    ///
+    /// It fails with [`Error::Io`] of the system's error for too many open files (`EMFILE`) if the
+    /// file descriptors don't fit under the process's soft limit of open files.
+    /// [`raise_fd_limit`](crate::raise_fd_limit) raises that limit, up to the hard limit that the
+    /// service's `LimitNOFILE=` sets. It fails with [`Error::InvalidHandover`] for a hand-over that
+    /// this version of zoter can't make sense of. That includes file descriptors of the state or
+    /// of an item that are missing for any reason other than that limit. It fails with
+    /// [`Error::UnsupportedHandover`] for a hand-over that a later version of zoter laid out. On
+    /// failure, the file descriptors of the hand-over are closed, which disconnects the peers of
+    /// the items.
+    ///
+    /// Taking over also tells systemd that the service has started, which a unit of `Type=notify`
+    /// waits for. It does so whatever comes of the take-over: with nothing handed over, or with a
+    /// hand-over that fails to be taken over, the service starts afresh. So a service takes over
+    /// each time it starts, and tells systemd nothing of its start itself. Its clients wait for
+    /// it meanwhile in the sockets of socket activation, which systemd keeps, and in those that
+    /// it takes over. That is why there is no `Store` without such a socket
+    /// ([`Error::NoSocket`]). A failure to tell systemd only logs a warning.
+    pub fn take_over(&mut self, passed: &mut Passed) -> Result<Option<Restored>> {
+        let restored = self.take_handover(passed);
+        // With the hand-over or without it, the service goes on from here, so it has started.
+        if let Err(e) = self.notifier.notify("READY=1") {
+            warn!("Failed to tell systemd that the service has started: {e}");
+        }
+
+        restored
+    }
+
+    /// Hand over to the next instance: store `state`, the state of the service, and `items`, in
+    /// their order, each under its id, for the next instance, and wait for systemd to have dealt
+    /// with them.
+    ///
+    /// The service does this once it stopped taking requests.
+    ///
+    /// The state of a service that has none is `&[][..]`. zoter doesn't look at the ids, nor
+    /// checks that they are unique: it gives each back with its item, for the state to refer to
+    /// the item by. The items are of any type, borrowed or owned, those of different types as
+    /// `&dyn Save` or `Box<dyn Save>`.
+    ///
+    /// Either the whole hand-over is stored, or this fails: no part of it is left out. It fails
+    /// with [`Error::Unsaved`] if the state or an item can't be saved, or if saving its record
+    /// fails. The error names the id of the item, and nothing is stored. It fails with
+    /// [`Error::StoreFull`] if the file descriptors don't fit in the store. The service's
+    /// `FileDescriptorStoreMax=` makes the store hold more. It fails with [`Error::Io`] for any I/O
+    /// error while storing the memfd or the file descriptors, or while queueing them for the
+    /// store. It fails with [`Error::TimedOut`] if systemd takes longer than 5 s to process what
+    /// was stored. A hand-over that fails after the memfd was stored may leave part of itself in
+    /// the store. The next instance fails to take that part over, and removes it from the store
+    /// like any other hand-over.
+    pub fn hand_over<S, I, T>(self, state: S, items: I) -> Result<Stored>
+    where
+        S: Save,
+        I: IntoIterator<Item = (u64, T)>,
+        T: Save,
+    {
+        let items: Vec<_> = items.into_iter().collect();
+        // The rest takes no generics, so that it is built once, whatever the types.
+        let items: Vec<_> = items
+            .iter()
+            .map(|(id, item)| (*id, item as &dyn Save))
+            .collect();
+
+        self.store_all(&state, &items)
+    }
+
+    /// The store of the service that `notifier` reaches, under `key`, which takes `max` file
+    /// descriptors. It fails as [`from_env`](Self::from_env) does for such a key and size.
+    pub(crate) fn with_notifier(notifier: Notifier, key: &str, max: usize) -> Result<Self> {
+        check_key(key)?;
+        if max < MIN_STORE {
+            return Err(Error::StoreTooSmall { max });
+        }
+        let reserve = Reserve::new()
+            .inspect_err(|e| warn!("Failed to keep file descriptors to hand over with: {e}"))
+            .ok();
+
+        Ok(Self {
+            notifier,
+            key: key.to_owned(),
+            max,
+            reserve,
+        })
+    }
+
+    /// What the previous instance handed over, out of `passed`, as
+    /// [`take_over`](Self::take_over) tells.
+    fn take_handover(&self, passed: &mut Passed) -> Result<Option<Restored>> {
         let prefix = format!("{}/", self.key);
         let stored = passed.take_prefixed(&prefix);
         // More than one file descriptor may come under a name, as the queue sockets do.
@@ -167,9 +251,8 @@ impl Store {
 
         let mut fds = take_queued(queues)?;
         let state_fds = take_fds(&mut fds, 0..contents.state_fds).ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                "file descriptors of the state of the hand-over are missing",
+            Error::InvalidHandover(
+                "file descriptors of the state of the hand-over are missing".to_owned(),
             )
         })?;
         let mut items = Vec::with_capacity(contents.entries.len());
@@ -180,10 +263,9 @@ impl Store {
         } in contents.entries
         {
             let Some(fds) = take_fds(&mut fds, indexes) else {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("file descriptors of item {id} of the hand-over are missing"),
-                ));
+                return Err(Error::InvalidHandover(format!(
+                    "file descriptors of item {id} of the hand-over are missing"
+                )));
             };
             items.push(Slot { id, record, fds });
         }
@@ -202,92 +284,50 @@ impl Store {
         }))
     }
 
-    /// Start a hand-over to the next instance through the store, which
-    /// [stores](Handover::store) the state of the service and its items once the service stopped
-    /// taking requests.
-    ///
-    /// It fails with [`ErrorKind::Unsupported`] if the store can't take a hand-over, saying why,
-    /// and which setting of the unit to change: systemd keeps no store for the service, or one that
-    /// takes fewer than the 2 file descriptors that a hand-over takes at least, the memfd and a
-    /// queue socket. It logs nothing, so that a service that can't hand over shuts down as it does
-    /// without systemd, rather than stop taking requests to hand over. The store goes either way,
-    /// and its [notifier](Self::notifier) with it, unless the service cloned it.
-    pub fn handover(self) -> io::Result<Handover> {
-        match self.max {
-            Some(max) if max >= MIN_STORE => Ok(Handover::new(self)),
-            Some(max) => Err(io::Error::new(
-                ErrorKind::Unsupported,
-                format!(
-                    "the file descriptor store takes {max}, which is too few: raise \
-                     `FileDescriptorStoreMax=` of the service to {MIN_STORE} at least"
-                ),
-            )),
-            None => Err(io::Error::new(
-                ErrorKind::Unsupported,
-                format!(
-                    "systemd keeps no file descriptor store for the service, as `$FDSTORE` isn't \
-                     set: set `FileDescriptorStoreMax=` of the service to {MIN_STORE} at least, \
-                     under systemd 254 or later"
-                ),
-            )),
-        }
-    }
-
-    /// Store `state` and `items`, as [`Handover::store`] tells.
-    pub(crate) fn hand_over(
-        mut self,
-        state: &dyn Save,
-        items: &[(u64, &dyn Save)],
-    ) -> io::Result<Stored> {
+    /// Store `state` and `items`, as [`hand_over`](Self::hand_over) tells.
+    fn store_all(mut self, state: &dyn Save, items: &[(u64, &dyn Save)]) -> Result<Stored> {
         // The store takes the memfd, and as many queue sockets as it has room for besides: one at
-        // least, as `handover` checked.
-        let room = self.max.unwrap_or(MIN_STORE) - 1;
+        // least, as `new` checked.
+        let room = self.max - 1;
         // The file descriptors kept from the start are given up for those that storing opens, each
         // closed before the next opens: the memfd, the two ends of each pair whose one end is a
         // queue socket, and the two ends of the pipe of the barrier.
         self.reserve = None;
 
-        let state_len = state.saved_len().ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidInput,
-                "the state of the hand-over can't be saved",
-            )
+        let state_len = state.saved_len().ok_or(Error::Unsaved {
+            item: None,
+            source: None,
         })?;
         let lens = items
             .iter()
             .map(|(id, item)| {
-                item.saved_len().ok_or_else(|| {
-                    io::Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("item {id} of the hand-over can't be saved"),
-                    )
+                item.saved_len().ok_or(Error::Unsaved {
+                    item: Some(*id),
+                    source: None,
                 })
             })
-            .collect::<io::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
         let state_fds = state.fds();
         let item_fds: Vec<_> = items.iter().map(|(_, item)| item.fds()).collect();
 
         let layout = Layout::new(state_len, lens.into_iter())?;
         {
             let name = self.name(STATE);
-            let memfd = memfd::filled(&name, layout.len(), |memfd| -> io::Result<()> {
-                state.save(&mut memfd[layout.state()]).map_err(|e| {
-                    io::Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("the state of the hand-over failed to be saved: {e}"),
-                    )
-                })?;
+            let memfd = memfd::filled(&name, layout.len(), |memfd| -> Result<()> {
+                state
+                    .save(&mut memfd[layout.state()])
+                    .map_err(|e| Error::Unsaved {
+                        item: None,
+                        source: Some(Box::new(e)),
+                    })?;
                 let mut entries = Vec::with_capacity(items.len());
                 let mut next = state_fds.len() as u64;
                 for (place, ((id, item), fds)) in items.iter().zip(&item_fds).enumerate() {
-                    item.save(&mut memfd[layout.item(place)]).map_err(|e| {
-                        io::Error::new(
-                            ErrorKind::InvalidInput,
-                            format!(
-                                "the record of item {id} of the hand-over failed to be saved: {e}"
-                            ),
-                        )
-                    })?;
+                    item.save(&mut memfd[layout.item(place)])
+                        .map_err(|e| Error::Unsaved {
+                            item: Some(*id),
+                            source: Some(Box::new(e)),
+                        })?;
                     let first = next;
                     next += fds.len() as u64;
                     entries.push(Entry {
@@ -336,6 +376,25 @@ impl Store {
     }
 }
 
+/// What [`Store::hand_over`] stored: all of the hand-over.
+#[derive(Debug)]
+pub struct Stored {
+    items: usize,
+    fds: usize,
+}
+
+impl Stored {
+    /// How many items were stored, whole.
+    pub fn items(&self) -> usize {
+        self.items
+    }
+
+    /// How many file descriptors were stored, those of the state included.
+    pub fn fds(&self) -> usize {
+        self.fds
+    }
+}
+
 /// File descriptors that a store keeps from its creation on, to give up for those that storing a
 /// hand-over opens: however many file descriptors the service has open by then, it has those to
 /// spare.
@@ -362,14 +421,14 @@ impl Reserve {
 /// as many as that takes, `room` at most, and hand each one to `store`, once it took all that it
 /// takes.
 ///
-/// It fails with [`ErrorKind::StorageFull`] if `room` queue sockets don't take all of them, and
-/// with the error of queueing them if that fails. The queue sockets that `store` got by then stay
+/// It fails with [`Error::StoreFull`] if `room` queue sockets can't hold all of them. If queueing
+/// them fails, it fails with that error. The queue sockets that `store` received up to then stay
 /// stored.
-fn queue_fds<'c, 'f, C, S>(chunks: C, room: usize, mut store: S) -> io::Result<()>
+fn queue_fds<'c, 'f, C, S>(chunks: C, room: usize, mut store: S) -> Result<()>
 where
     'f: 'c,
     C: IntoIterator<Item = &'c [BorrowedFd<'f>]>,
-    S: FnMut(OwnedFd) -> io::Result<()>,
+    S: FnMut(OwnedFd) -> Result<()>,
 {
     let mut chunks = chunks.into_iter().peekable();
     let mut index = 0;
@@ -398,7 +457,8 @@ where
             // Any other queue would take none either.
             return Err(io::Error::other(
                 "a queue socket took none of the file descriptors of the hand-over",
-            ));
+            )
+            .into());
         }
         store(queue.into_socket())?;
     }
@@ -406,13 +466,7 @@ where
         return Ok(());
     }
 
-    Err(io::Error::new(
-        ErrorKind::StorageFull,
-        format!(
-            "the file descriptor store takes too few file descriptors for those of the hand-over, \
-             {room} queue sockets besides the memfd: raise `FileDescriptorStoreMax=` of the service"
-        ),
-    ))
+    Err(Error::StoreFull)
 }
 
 /// The file descriptors out of the queue sockets that hold them, `queues`, as [`queue::take`]
@@ -421,7 +475,7 @@ where
 /// It fails with the system's error of too many open files (`EMFILE`) if the kernel closed any of
 /// them, as it does with those that the process can't have open. It warns of a queue socket that
 /// fails to give them, whose file descriptors from there on close with it, and are missing then.
-fn take_queued(queues: Vec<OwnedFd>) -> io::Result<HashMap<u64, OwnedFd>> {
+fn take_queued(queues: Vec<OwnedFd>) -> Result<HashMap<u64, OwnedFd>> {
     let mut fds = HashMap::new();
     let mut complete = true;
     for queue in queues {
@@ -441,7 +495,7 @@ fn take_queued(queues: Vec<OwnedFd>) -> io::Result<HashMap<u64, OwnedFd>> {
              too many open: raise the hard limit of `LimitNOFILE=` of the service."
         );
 
-        return Err(Errno::MFILE.into());
+        return Err(Error::os(Errno::MFILE));
     }
 
     Ok(fds)
@@ -463,31 +517,23 @@ fn take_fds(fds: &mut HashMap<u64, OwnedFd>, indexes: Range<u64>) -> Option<Vec<
     taken.into_iter().collect()
 }
 
-/// How many file descriptors the store of the service takes, `$FDSTORE`, if it has one.
+/// How many file descriptors the store of the service takes, `$FDSTORE`, if systemd tells.
 ///
 /// systemd sets it to the `FileDescriptorStoreMax=` of the unit when that isn't 0, from version 254
-/// on. It is `None` if the variable is unset, 0, or not a number.
+/// on. It is `None` if the variable is unset or not a number.
 fn fd_store_max() -> Option<usize> {
-    parse_store_max(env::var("FDSTORE").ok().as_deref())
-}
-
-/// The value of `$FDSTORE`, if it's a number that isn't 0.
-fn parse_store_max(value: Option<&str>) -> Option<usize> {
-    value?.parse().ok().filter(|max| *max > 0)
+    env::var("FDSTORE").ok()?.parse().ok()
 }
 
 /// Check that `key` is one that the names of the store can start with: 1 to [`MAX_KEY_LEN`]
 /// printable ASCII characters, other than `:`, which no name of the store has, and `/`, which
 /// comes after the key in a name.
-fn check_key(key: &str) -> io::Result<()> {
+fn check_key(key: &str) -> Result<()> {
     let valid = |b: u8| (b' '..=b'~').contains(&b) && b != b':' && b != b'/';
     if key.is_empty() || key.len() > MAX_KEY_LEN || !key.bytes().all(valid) {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "a key is 1 to {MAX_KEY_LEN} printable ASCII characters, other than `:` and `/`"
-            ),
-        ));
+        return Err(Error::InvalidName(format!(
+            "a key is 1 to {MAX_KEY_LEN} printable ASCII characters, other than `:` and `/`"
+        )));
     }
 
     Ok(())
@@ -495,7 +541,7 @@ fn check_key(key: &str) -> io::Result<()> {
 
 /// The fewest file descriptors that the store has to take for a hand-over: the memfd and a queue
 /// socket.
-const MIN_STORE: usize = 2;
+pub(crate) const MIN_STORE: usize = 2;
 /// How long a hand-over waits for the service manager to deal with what it stored.
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest key.
