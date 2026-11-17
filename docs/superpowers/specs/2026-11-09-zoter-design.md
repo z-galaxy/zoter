@@ -452,9 +452,9 @@ For a service that runs in the test process, `testing::store` gives the store th
 `Store::from_env` would, out of `Manager::notify_socket` and `Manager::store_max`, and
 `Manager::passed` gives what `Passed::from_env` would. Tests wait for a state
 (`wait_for("READY=1", timeout)`), wait for the manager to have dealt with what a service sent
-(`barrier(timeout)`), look at the store, and empty it, as a stop does. busd, zbus and zlink test
-their restarts with it. They build the crate as a dependency, as its own integration test and
-benchmark do, where `cfg(test)` is off: hence a feature.
+(`barrier(timeout)`), look at the store, and empty it, as a stop does. busd and zlink test their
+restarts with it. They build the crate as a dependency, as its own integration test and benchmark
+do, where `cfg(test)` is off: hence a feature.
 
 It needs `libc`, which rustix doesn't replace there: `dup2` onto FDs that the child doesn't own yet,
 and `kcmp(2)`, to tell FDs of one open file description apart as systemd does. Both are optional
@@ -540,7 +540,8 @@ With a feature on Linux, with `std`, as the hand-over of zbus is:
   and its version goes to 2. The stored names become `busd/state` and `busd/fds`.
 - The in-process hand-over (`Bus::hand_over`, then `Bus::take_over`), which the tests and the
   benchmark use without systemd, stays as it is: it hands Rust values over, with no memfd.
-- `tests/fdstore.rs` and the benchmark use `zoter::testing::Manager` rather than their own.
+- `tests/fdstore.rs` uses `zoter::testing::Manager` rather than a fake of its own. The benchmark
+  keeps a fake systemd of its own, and creates its stores with `zoter::testing::store`.
 - `raise_fd_limit` stays in busd, which runs on macOS too and caps the limit there.
 
 ## Name
