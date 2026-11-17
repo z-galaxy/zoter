@@ -83,8 +83,8 @@ fn main() -> zoter::Result<()> {
 async fn serve(mut passed: zoter::Passed) -> zoter::Result<()> {
     // Fails with `Error::NoManager` without `$NOTIFY_SOCKET`, as when systemd didn't start the
     // service, which serves without a hand-over then. Fails otherwise if systemd keeps no store
-    // for the service that can hold a hand-over.
-    let mut store = match zoter::Store::from_env("example") {
+    // for the service that can hold a hand-over, or passed it no socket of socket activation.
+    let mut store = match zoter::Store::from_env("example", &passed) {
         Ok(store) => store,
         Err(zoter::Error::NoManager) => return serve_without_a_store(passed).await,
         Err(e) => return Err(e),
@@ -124,11 +124,14 @@ systemd starts the next instance with the sockets of socket activation and what 
 `Store::take_over` gives back what `Store::hand_over` stored. The unit needs
 `FileDescriptorStoreMax=` of 2 at least (the state memfd and one queue socket), systemd 254 or
 later (for `$FDSTORE`), and a socket unit, so that systemd keeps the listening socket, and the
-clients that connect meanwhile, while no instance runs. Without the first two there is no `Store`:
-`Store::from_env` fails. Its error tells a process that systemd takes no notifications from
-(`Error::NoManager`), as one that it doesn't run, from a service that it does take them from but
-keeps no store for, as one of `Type=notify` (`Error::NoStore`). A service that also runs without
-systemd goes on without a hand-over on the former.
+clients that connect meanwhile, while no instance runs, with `Requires=` on it in the unit of the
+service, as systemd otherwise starts the service without the socket where the socket unit isn't
+active. Without any of the three there is no `Store`: `Store::from_env` fails. Its error tells a
+process that systemd takes no notifications from (`Error::NoManager`), as one that it doesn't run,
+from a service that it does take them from but keeps no store for, as one of `Type=notify`
+(`Error::NoStore`), and from a service that has a store but was passed no socket
+(`Error::NoSocket`). A service that also runs without systemd goes on without a hand-over on the
+first.
 
 ## API
 
@@ -234,8 +237,10 @@ impl Store {
     /// takes `$FDSTORE` FDs. It fails with `Error::NoManager` if `$NOTIFY_SOCKET` is unset or
     /// empty: systemd takes no notifications from the process, as when it doesn't run it. It
     /// fails with `Error::NoStore` if `$FDSTORE` is unset or not a number, and with
-    /// `Error::StoreTooSmall` if it is less than 2 (the state memfd and a queue socket).
-    pub fn from_env(key: &str) -> zoter::Result<Self>;
+    /// `Error::StoreTooSmall` if it is less than 2 (the state memfd and a queue socket). It fails
+    /// with `Error::NoSocket` if `passed`, what systemd passed the service, was created with
+    /// nothing but what is stored under the key, if that.
+    pub fn from_env(key: &str, passed: &Passed) -> zoter::Result<Self>;
     /// Take over from the previous instance: take the FDs stored under the key out of `passed`,
     /// remove them from the store, and read the whole hand-over that they hold, if any. It fails
     /// with `Error::Io` of `EMFILE` if the FDs don't fit under the process's soft limit of open
@@ -407,6 +412,10 @@ Creating the store:
 - The store takes fewer than 2 FDs: `Store::from_env` fails with `Error::StoreTooSmall`. One
   check judges the number, for it and for `testing::store` alike, so a `$FDSTORE` of 0, which
   systemd never sets, fails as a size of 0 does.
+- systemd passed the service nothing but what is stored under the key, if that, so no socket of
+  socket activation: `Store::from_env` fails with `Error::NoSocket`, after the checks above. It
+  goes by what `passed` was created with, whatever was taken out of it since, and counts a name
+  under another key as a socket.
 
 Either way the service has no `Store`, so it neither takes over nor hands over.
 
@@ -585,6 +594,14 @@ restarts. It is free on crates.io, and its repository is `z-galaxy/zoter`.
     went with it: only tests and benchmarks created a `Store` that way, so `testing::store` does
     it for them, from the address of the notification socket. Tests wait for the fake manager
     with `Manager::barrier` in place of `Manager::notifier`.
+12. A `Store` needs socket activation (`Error::NoSocket`). `READY=1` is sent at take-over, which is
+    before the service listens unless systemd holds its socket, so that the units ordered after the
+    service, and its `ExecStartPost=`, would otherwise find no socket to connect to. A readiness
+    call of the service's own, to send `READY=1` once it listens, was decided against: it is one
+    more thing for a service to call in the right order, and it exposes the notification, which
+    decision 11 keeps private. The service unit needs `Requires=` on the socket unit, as
+    systemd.socket(5) says: "No implicit WantedBy= or RequiredBy= dependency from the socket to
+    the service is added. This means that the service may be started without the socket".
 
 ## The plan
 

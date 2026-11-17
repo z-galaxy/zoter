@@ -422,7 +422,8 @@ fn from_the_environment() {
         return;
     }
 
-    let store = Store::from_env(KEY).unwrap();
+    let passed = passed(&["web"]);
+    let store = Store::from_env(KEY, &passed).unwrap();
     assert_eq!(store.max, 16);
     // A number that `$FDSTORE` tells is judged as one that `testing::store` is given: a
     // hand-over doesn't fit in a store that takes fewer than 2 file descriptors.
@@ -430,7 +431,7 @@ fn from_the_environment() {
         // SAFETY: The test runs in a process of its own, which has no other thread that reads or
         // writes the environment. So do the ones below.
         unsafe { env::set_var("FDSTORE", max.to_string()) };
-        let error = Store::from_env(KEY).unwrap_err();
+        let error = Store::from_env(KEY, &passed).unwrap_err();
         assert!(
             matches!(error, Error::StoreTooSmall { max: too_few } if too_few == max),
             "{max}: {error:?}"
@@ -441,7 +442,7 @@ fn from_the_environment() {
     for value in ["", "-1", "x", "1.5", " 1", "99999999999999999999"] {
         // SAFETY: As above.
         unsafe { env::set_var("FDSTORE", value) };
-        let error = Store::from_env(KEY).unwrap_err();
+        let error = Store::from_env(KEY, &passed).unwrap_err();
         assert!(
             matches!(error, Error::NoStore),
             "$FDSTORE={value:?}: {error:?}"
@@ -449,7 +450,7 @@ fn from_the_environment() {
     }
     // SAFETY: As above.
     unsafe { env::remove_var("FDSTORE") };
-    let error = Store::from_env(KEY).unwrap_err();
+    let error = Store::from_env(KEY, &passed).unwrap_err();
     assert!(matches!(error, Error::NoStore), "{error:?}");
     assert!(
         error.to_string().contains("`FileDescriptorStoreMax=`"),
@@ -470,13 +471,114 @@ fn from_the_environment() {
                     None => env::remove_var("NOTIFY_SOCKET"),
                 }
             }
-            let error = Store::from_env(KEY).unwrap_err();
+            let error = Store::from_env(KEY, &passed).unwrap_err();
             assert!(
                 matches!(error, Error::NoManager),
                 "$NOTIFY_SOCKET={socket:?} $FDSTORE={fd_store:?}: {error:?}"
             );
         }
     }
+}
+
+/// A store needs a socket of socket activation: something systemd passed other than what is stored
+/// under its key.
+#[test]
+fn no_store_without_a_socket() {
+    let exports = "NOTIFY_SOCKET=/run/systemd/notify FDSTORE=16";
+    if !in_own_process("store::tests::no_store_without_a_socket", exports) {
+        return;
+    }
+
+    let state = format!("{KEY}/state");
+    let fds = format!("{KEY}/fds");
+    let no_socket = |names: &[&str]| {
+        let error = Store::from_env(KEY, &passed(names)).unwrap_err();
+        assert!(matches!(error, Error::NoSocket), "{names:?}: {error:?}");
+        assert!(error.to_string().contains("`Requires=`"), "{error}");
+        assert_eq!(io::Error::from(error).kind(), io::ErrorKind::Unsupported);
+    };
+    // Nothing is passed, or only what is stored under the key.
+    no_socket(&[]);
+    no_socket(&[&state, &fds]);
+    no_socket(&[&fds, &fds, &state]);
+
+    assert_eq!(Store::from_env(KEY, &passed(&["web"])).unwrap().max, 16);
+    assert!(Store::from_env(KEY, &passed(&["web", &state, &fds])).is_ok());
+    assert!(Store::from_env(KEY, &passed(&[&state, "web"])).is_ok());
+    // A name that only starts as the key does is another key's, which counts as a socket.
+    assert!(Store::from_env(KEY, &passed(&["test"])).is_ok());
+    assert!(Store::from_env(KEY, &passed(&[&format!("{KEY}x/state")])).is_ok());
+}
+
+/// A store is made whether or not the socket was taken out of `passed` before, as a service takes
+/// its socket as it likes, before or after it makes the store.
+#[test]
+fn store_with_the_socket_taken_before() {
+    let exports = "NOTIFY_SOCKET=/run/systemd/notify FDSTORE=16";
+    if !in_own_process("store::tests::store_with_the_socket_taken_before", exports) {
+        return;
+    }
+
+    let mut passed = passed(&["web", &format!("{KEY}/state")]);
+    assert!(passed.take("web").is_some());
+    assert!(passed.take_prefixed(&format!("{KEY}/")).len() == 1);
+    assert!(passed.is_empty());
+    assert!(Store::from_env(KEY, &passed).is_ok());
+}
+
+/// A file descriptor under the name of another key counts as a socket.
+#[test]
+fn store_with_a_name_under_another_key() {
+    let exports = "NOTIFY_SOCKET=/run/systemd/notify FDSTORE=16";
+    if !in_own_process("store::tests::store_with_a_name_under_another_key", exports) {
+        return;
+    }
+
+    let passed = passed(&["other/state", "other/fds"]);
+    assert!(Store::from_env(KEY, &passed).is_ok());
+}
+
+/// The error for a missing store comes before that for a missing socket, and that for a missing
+/// manager before both.
+#[test]
+fn the_checks_of_from_env_come_in_order() {
+    let exports = "NOTIFY_SOCKET=/run/systemd/notify";
+    if !in_own_process(
+        "store::tests::the_checks_of_from_env_come_in_order",
+        exports,
+    ) {
+        return;
+    }
+
+    let nothing = passed(&[]);
+    let error = Store::from_env(KEY, &nothing).unwrap_err();
+    assert!(matches!(error, Error::NoStore), "{error:?}");
+    // SAFETY: The test runs in a process of its own, which has no other thread that reads or
+    // writes the environment.
+    unsafe { env::set_var("FDSTORE", "1") };
+    let error = Store::from_env(KEY, &nothing).unwrap_err();
+    assert!(
+        matches!(error, Error::StoreTooSmall { max: 1 }),
+        "{error:?}"
+    );
+    // SAFETY: As above.
+    unsafe { env::set_var("FDSTORE", "16") };
+    let error = Store::from_env("bad/key", &nothing).unwrap_err();
+    assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
+    // SAFETY: As above.
+    unsafe { env::remove_var("NOTIFY_SOCKET") };
+    let error = Store::from_env(KEY, &nothing).unwrap_err();
+    assert!(matches!(error, Error::NoManager), "{error:?}");
+}
+
+/// What systemd passed, as these names: each is a pipe.
+fn passed(names: &[&str]) -> Passed {
+    Passed::new(
+        names
+            .iter()
+            .map(|name| (name.to_string(), pipe().1))
+            .collect(),
+    )
 }
 
 /// A store of the manager, under `KEY`, that takes as many file descriptors as the store of the

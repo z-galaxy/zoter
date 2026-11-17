@@ -34,11 +34,13 @@ use crate::{
 /// next instance, under the same key, as a [`Restored`]. Several keys keep several hand-overs
 /// apart, in one store.
 ///
-/// The unit of the service needs `FileDescriptorStoreMax=` of 2 at least, for systemd to keep a
-/// store, and systemd 254 or later, which tells the service how many file descriptors the store
-/// takes, in `$FDSTORE`. Without them there is no `Store`, as [`from_env`](Self::from_env) tells.
-/// A socket unit has systemd keep the socket that the service listens on, and the clients that
-/// connect meanwhile, while no instance runs.
+/// A service needs three things, without which there is no `Store`, as
+/// [`from_env`](Self::from_env) tells. It needs a socket unit, which has systemd keep the socket
+/// that the service listens on, and the clients that connect meanwhile, while no instance runs, and
+/// `Requires=` on it in the unit of the service, as systemd otherwise starts the service without
+/// the socket where the socket unit isn't active. It needs `FileDescriptorStoreMax=` of 2 at least,
+/// for systemd to keep a store. And it needs systemd 254 or later, which tells the service how many
+/// file descriptors the store takes, in `$FDSTORE`.
 ///
 /// # What the store holds
 ///
@@ -77,6 +79,11 @@ impl Store {
     /// takes as many file descriptors as `$FDSTORE` tells. systemd sets both for a service whose
     /// unit has a `FileDescriptorStoreMax=` above 0, `$FDSTORE` from version 254 on.
     ///
+    /// `passed` is what systemd passed the service, as [`Passed::from_env`] takes it. The store is
+    /// only for a service that systemd passed a socket of socket activation, for the reason that
+    /// [`take_over`](Self::take_over) gives. What was taken out of `passed` before doesn't matter:
+    /// this goes by what `passed` was created with.
+    ///
     /// The key is 1 to 200 printable ASCII characters other than `:` and `/`. For any other key,
     /// this fails with [`Error::InvalidName`].
     ///
@@ -89,6 +96,12 @@ impl Store {
     /// or is older than 254. It fails with [`Error::StoreTooSmall`] if `$FDSTORE` is less than 2,
     /// the fewest that a hand-over takes: the memfd and a queue socket.
     ///
+    /// It fails with [`Error::NoSocket`] if systemd passed the service nothing but what is stored
+    /// under the key, if that. A file descriptor under any other name counts as a socket, even one
+    /// that is stored under another key, which this doesn't tell from a socket. The checks run in
+    /// the order above, so a service that lacks both a store and a socket is told of the store
+    /// first.
+    ///
     /// `$NOTIFY_SOCKET` is the path of a socket if it starts with a `/`, and the name of an
     /// abstract socket, after the `@`, if it starts with one. A `/` or an `@` alone names nothing,
     /// and fails with [`Error::Environment`]. systemd also has `vsock:` addresses, which a virtual
@@ -96,11 +109,15 @@ impl Store {
     /// with [`Error::Environment`] too, like any other address that is neither a path nor an
     /// abstract name. A name too long for a socket address fails with [`Error::Io`] of
     /// `ENAMETOOLONG`.
-    pub fn from_env(key: &str) -> Result<Self> {
+    pub fn from_env(key: &str, passed: &Passed) -> Result<Self> {
         let notifier = Notifier::from_env()?.ok_or(Error::NoManager)?;
         let max = fd_store_max().ok_or(Error::NoStore)?;
+        let store = Self::with_notifier(notifier, key, max)?;
+        if !passed.had_other_than(&format!("{key}/")) {
+            return Err(Error::NoSocket);
+        }
 
-        Self::with_notifier(notifier, key, max)
+        Ok(store)
     }
 
     /// Take over from the previous instance: take the file descriptors stored under the key out
@@ -130,7 +147,8 @@ impl Store {
     /// hand-over that fails to be taken over, the service starts afresh. So a service takes over
     /// each time it starts, and tells systemd nothing of its start itself. Its clients wait for
     /// it meanwhile in the sockets of socket activation, which systemd keeps, and in those that
-    /// it takes over. A failure to tell systemd only logs a warning.
+    /// it takes over. That is why there is no `Store` without such a socket
+    /// ([`Error::NoSocket`]). A failure to tell systemd only logs a warning.
     pub fn take_over(&mut self, passed: &mut Passed) -> Result<Option<Restored>> {
         let restored = self.take_handover(passed);
         // With the hand-over or without it, the service goes on from here, so it has started.

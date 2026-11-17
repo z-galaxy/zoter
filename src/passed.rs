@@ -26,6 +26,9 @@ use crate::{Error, Result};
 #[derive(Debug, Default)]
 pub struct Passed {
     fds: Vec<(String, OwnedFd)>,
+    /// The names of the file descriptors that this was created with, whatever was taken out of it
+    /// since.
+    created_with: Vec<String>,
 }
 
 impl Passed {
@@ -82,7 +85,9 @@ impl Passed {
 
     /// File descriptors passed to this process some other way, with their names.
     pub fn new(fds: Vec<(String, OwnedFd)>) -> Self {
-        Self { fds }
+        let created_with = fds.iter().map(|(name, _)| name.clone()).collect();
+
+        Self { fds, created_with }
     }
 
     /// Take the first file descriptor named `name`, if any.
@@ -120,6 +125,14 @@ impl Passed {
     /// The file descriptors that are left, with their names, in their order.
     pub fn into_vec(self) -> Vec<(String, OwnedFd)> {
         self.fds
+    }
+
+    /// Whether this was created with a file descriptor whose name doesn't start with `prefix`,
+    /// whatever was taken out of it since.
+    pub(crate) fn had_other_than(&self, prefix: &str) -> bool {
+        self.created_with
+            .iter()
+            .any(|name| !name.starts_with(prefix))
     }
 
     /// Take every file descriptor whose name starts with `prefix`, with its name, in their order.
@@ -359,6 +372,46 @@ mod tests {
         let left = passed.into_vec();
         assert_eq!(left[0].0, "b");
         assert_eq!(left[0].1.as_raw_fd(), all[1]);
+    }
+
+    /// What this was created with is remembered by name, whatever is taken out of it later.
+    #[test]
+    fn had_other_than_remembers_what_it_was_created_with() {
+        let fd = || pipe().1;
+        let passed = |names: &[&str]| {
+            Passed::new(names.iter().map(|name| (name.to_string(), fd())).collect())
+        };
+
+        assert!(!Passed::default().had_other_than("key/"));
+        assert!(!passed(&[]).had_other_than("key/"));
+        assert!(!passed(&["key/state", "key/fds", "key/fds"]).had_other_than("key/"));
+        assert!(passed(&["key/state", "web"]).had_other_than("key/"));
+        assert!(passed(&["other/state"]).had_other_than("key/"));
+        assert!(passed(&["unknown"]).had_other_than("key/"));
+        assert!(!passed(&["web"]).had_other_than(""));
+        assert!(!passed(&["web"]).had_other_than("w"));
+
+        let mut passed = passed(&["web", "key/state", "web", "key/fds", "ssh"]);
+        assert!(passed.had_other_than("key/"));
+        passed.take("web").unwrap();
+        assert!(passed.had_other_than("key/"));
+        assert_eq!(passed.take_all("web").len(), 1);
+        assert!(passed.had_other_than("key/"));
+        assert_eq!(passed.take_prefixed("key/").len(), 2);
+        assert!(passed.had_other_than("key/"));
+        passed.take("ssh").unwrap();
+        assert!(passed.is_empty());
+        assert!(passed.had_other_than("key/"));
+        let left = passed.into_vec();
+        assert!(left.is_empty());
+    }
+
+    #[test]
+    fn had_other_than_ignores_what_was_taken_out_when_nothing_else_was_there() {
+        let mut passed = Passed::new(vec![("key/state".to_owned(), pipe().1)]);
+        passed.take_prefixed("key/");
+        assert!(passed.is_empty());
+        assert!(!passed.had_other_than("key/"));
     }
 
     #[test]

@@ -61,7 +61,7 @@ fn serve() {
     // SAFETY: The test runs in a process of its own, whose other threads don't read or write the
     // environment, and where nothing took the file descriptors that the manager passed.
     let mut passed = unsafe { Passed::from_env() }.unwrap();
-    let mut store = Store::from_env(KEY).unwrap();
+    let mut store = Store::from_env(KEY, &passed).unwrap();
     let restored = store.take_over(&mut passed).unwrap();
     let listener = UnixListener::from(passed.take(SOCKET).unwrap());
     let (mut count, client) = match restored {

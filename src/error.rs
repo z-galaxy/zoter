@@ -65,6 +65,16 @@ pub enum Error {
         /// The number of file descriptors that the store takes.
         max: usize,
     },
+    /// systemd passed the service no socket of socket activation.
+    ///
+    /// [`Store::from_env`](crate::Store::from_env) fails with it if systemd passed nothing but
+    /// what is stored under the key of the store, if that. A service tells systemd that it has
+    /// started as it takes over, before it has restored what it took over, which only holds where
+    /// its clients can wait for it meanwhile, in a socket that systemd keeps. So the service needs
+    /// a socket unit, and `Requires=` on it in its own unit: systemd otherwise starts the service
+    /// without the socket where the socket unit isn't active. Converted into an [`io::Error`], it
+    /// has the kind [`io::ErrorKind::Unsupported`].
+    NoSocket,
     /// The store has no room for the file descriptors of this hand-over.
     ///
     /// [`Store::hand_over`](crate::Store::hand_over) fails with it. Raising the service's
@@ -141,6 +151,11 @@ impl fmt::Display for Error {
                 "the file descriptor store takes {max}, which is too few: raise \
                  `FileDescriptorStoreMax=` of the service to {MIN_STORE} at least"
             ),
+            Self::NoSocket => f.write_str(
+                "systemd passed the service no socket of socket activation: add a socket unit for \
+                 the service, and `Requires=` on it to the unit of the service, so that systemd \
+                 never starts the service without it",
+            ),
             Self::StoreFull => f.write_str(
                 "the file descriptor store takes too few file descriptors for those of the \
                  hand-over: raise `FileDescriptorStoreMax=` of the service",
@@ -193,6 +208,7 @@ impl From<Error> for io::Error {
             Error::NoManager
             | Error::NoStore
             | Error::StoreTooSmall { .. }
+            | Error::NoSocket
             | Error::UnsupportedHandover(_) => io::ErrorKind::Unsupported,
             Error::StoreFull => io::ErrorKind::StorageFull,
             Error::TimedOut => io::ErrorKind::TimedOut,
@@ -228,6 +244,7 @@ mod tests {
             (Error::NoManager, io::ErrorKind::Unsupported),
             (Error::NoStore, io::ErrorKind::Unsupported),
             (Error::StoreTooSmall { max: 1 }, io::ErrorKind::Unsupported),
+            (Error::NoSocket, io::ErrorKind::Unsupported),
             (Error::StoreFull, io::ErrorKind::StorageFull),
             (unsaved, io::ErrorKind::InvalidInput),
             (

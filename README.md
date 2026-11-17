@@ -64,10 +64,11 @@ fn main() -> zoter::Result<()> {
     // nothing took the file descriptors that systemd passed.
     let mut passed = unsafe { Passed::from_env() }?;
 
-    // The store that systemd keeps for the service, which the units below have it keep. Without
-    // systemd there is none, and the example stops here. A service may as well serve on without a
-    // store then, and disconnect its clients as it stops.
-    let mut store = match Store::from_env("example") {
+    // The store that systemd keeps for the service, which the units below have it keep, for a
+    // service that systemd passed a socket. Without systemd there is none, and the example stops
+    // here. A service may as well serve on without a store then, and disconnect its clients as it
+    // stops.
+    let mut store = match Store::from_env("example", &passed) {
         Ok(store) => store,
         Err(Error::NoManager) => return Ok(()),
         Err(e) => return Err(e),
@@ -111,6 +112,10 @@ WantedBy=sockets.target
 
 ```ini
 # example.service
+[Unit]
+# systemd otherwise starts the service without its socket where the socket unit isn't active.
+Requires=example.socket
+
 [Service]
 # The service has started once it took over, which zoter tells systemd.
 Type=notify
@@ -122,7 +127,10 @@ FileDescriptorStoreMax=16
 `systemctl restart example` then restarts the service with its clients, which needs systemd 254 or
 later. A stop, or a start after a stop, doesn't keep them: systemd closes the store as the service
 stops for good. Without `FileDescriptorStoreMax=` in the unit, or under an older systemd, there is
-no store, and [`Store::from_env`] fails with [`Error::NoStore`].
+no store, and [`Store::from_env`] fails with [`Error::NoStore`]. Without a socket of socket
+activation, which `Requires=` on the socket unit sees to, there is none either, and it fails with
+[`Error::NoSocket`]: the service tells systemd that it has started as it takes over, and its
+clients wait in the socket meanwhile.
 
 ## Errors
 
@@ -134,6 +142,8 @@ wrong:
   doesn't run it at all. A service that also runs without systemd goes on without a store then.
 * [`Error::NoStore`], [`Error::StoreTooSmall`] and [`Error::StoreFull`] name the unit setting to
   raise, `FileDescriptorStoreMax=`.
+* [`Error::NoSocket`] means that systemd passed the service no socket of socket activation, which
+  needs a socket unit, and `Requires=` on it in the unit of the service.
 * [`Error::InvalidHandover`] and [`Error::UnsupportedHandover`] mean that the next instance can't
   take over the hand-over. It then starts afresh without it.
 * [`Error::Io`] is the error that the system returned, such as `EMFILE` when the file descriptors
@@ -177,6 +187,7 @@ In development: the API can change from one minor version to the next.
 [`Error::NoManager`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.NoManager
 [`Error::NoStore`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.NoStore
 [`Error::StoreTooSmall`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.StoreTooSmall
+[`Error::NoSocket`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.NoSocket
 [`Error::StoreFull`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.StoreFull
 [`Error::InvalidHandover`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.InvalidHandover
 [`Error::UnsupportedHandover`]: https://docs.rs/zoter/latest/zoter/enum.Error.html#variant.UnsupportedHandover
